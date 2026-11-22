@@ -131,6 +131,27 @@ def test_known_remaining_files(rel_path):
     _assert_single_import_style(rel_path)
 
 
+def _posix_rel(path: Path) -> str:
+    """Relative path with '/' separators on every OS.
+
+    CI runs on Windows, where str() of a Path uses '\\' — the
+    un-normalised string never matched the '/'-style inventory, so
+    every tracked file looked "new" and the guard failed on Windows
+    while passing on Linux (CI round 1: 1 failed, 11 passed,
+    11 xfailed). ``as_posix()`` is the fix.
+    """
+    return path.relative_to(REPO_ROOT).as_posix()
+
+
+def test_windows_style_paths_match_inventory():
+    """Regression for the Windows separator bug: a Windows-style
+    relative path must normalise to exactly the inventory spelling."""
+    from pathlib import PureWindowsPath
+    assert PureWindowsPath("src\\accounts\\vault.py").as_posix() == "src/accounts/vault.py"
+    for rel in EXPECTED_CLEAN + KNOWN_REMAINING:
+        assert PureWindowsPath(rel.replace("/", "\\")).as_posix() == rel
+
+
 def test_no_new_fallback_files():
     """Whole-tree guard: no src/**/*.py may carry a banned import
     unless it is already tracked in KNOWN_REMAINING."""
@@ -138,7 +159,7 @@ def test_no_new_fallback_files():
     for path in sorted(SRC_DIR.rglob("*.py")):
         hits = _banned_imports(path)
         if hits:
-            found[str(path.relative_to(REPO_ROOT))] = hits
+            found[_posix_rel(path)] = hits
     unexpected = sorted(set(found) - set(KNOWN_REMAINING))
     assert not unexpected, (
         "New file(s) with a fallback import — fix them or inventory them "
