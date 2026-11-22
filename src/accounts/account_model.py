@@ -8,6 +8,13 @@ stored here — see POSTGRES_DDL (raw_payload table has a TTL).
 Fail-closed: an illegal transition is rejected and audited, never
 silently coerced; fail-closed statuses (contracts.FAIL_CLOSED_STATUSES)
 mean no automatic job may run for that account.
+
+Import rule (fix_import_dual_contracts): exactly ONE import style for
+the contract — ``from src.contracts import ...`` run from the repo root.
+No ``from contracts import`` / ``from ..contracts import`` fallback:
+a fallback can load the same file as a second, distinct module object
+(``contracts`` vs ``src.contracts``), so Enum/dataclass identity checks
+(``is``, ``isinstance``) silently break across modules.
 """
 from __future__ import annotations
 
@@ -21,32 +28,18 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterable, Optional
 
-try:
-    from src.contracts import (
-        ALLOWED_ACCOUNT_TRANSITIONS,
-        FAIL_CLOSED_STATUSES,
-        AccountStatus,
-        AuditLogEntry,
-        AuthMethod,
-        Platform,
-        PlatformAccount,
-        TokenSet,
-        is_fail_closed_status,
-        utcnow,
-    )
-except ImportError:  # direct-module import (tests / scripts)
-    from contracts import (  # type: ignore
-        ALLOWED_ACCOUNT_TRANSITIONS,
-        FAIL_CLOSED_STATUSES,
-        AccountStatus,
-        AuditLogEntry,
-        AuthMethod,
-        Platform,
-        PlatformAccount,
-        TokenSet,
-        is_fail_closed_status,
-        utcnow,
-    )
+from src.contracts import (
+    ALLOWED_ACCOUNT_TRANSITIONS,
+    FAIL_CLOSED_STATUSES,
+    AccountStatus,
+    AuditLogEntry,
+    AuthMethod,
+    Platform,
+    PlatformAccount,
+    TokenSet,
+    is_fail_closed_status,
+    utcnow,
+)
 
 __all__ = [
     "POSTGRES_DDL", "InvalidTransitionError", "ValidationError",
