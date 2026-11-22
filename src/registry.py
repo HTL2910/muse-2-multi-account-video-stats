@@ -1,10 +1,4 @@
-` nào.** Quy ước nộp file chỉ biết ghi nội dung; bất kỳ khối FILE nào (kể cả để trống) cũng sẽ tái tạo lại file, đúng thứ hội đồng đã chốt xóa, và sẽ làm test guard dưới đây đỏ ngay. Vì vậy file mục tiêu được xử lý bằng lệnh xóa ở trên, sản phẩm nộp duy nhất là file test guard.
-
-Kiểm chứng trước khi xóa, đúng phương án đã chốt:
-- Đã đọc `docs/ARCHITECTURE.md` và `README.md` trên main: **không có bất kỳ tham chiếu nào** tới `registry`/`APPROACH_REGISTRY`/`register_approach` — phần "xóa tham chiếu trong docs" không có gì để xóa (các file `docs/hoi-dong-nghien-cuu/*.md` là bản ghi nghiên cứu lịch sử, không phải tài liệu sống trỏ tới module).
-- File trên main đúng như mô tả ba vòng liền: `APPROACH_REGISTRY = {}` + `register_approach` không caller; các vòng audit trước đã grep xác nhận không module nào import.
-
-Tự kiểm chứng trên VM với 3 trạng thái: (A) file đã xóa → **3 passed** + chạy lẻ PASS; (B) file còn tồn tại (trạng thái main hiện tại) → 3 test cùng fail; (C) file đã xóa nhưng còn một module import treo `from src.registry import ...` → đúng test tham chiếu fail. Guard khóa cả ba mặt: file không tồn tại, module không import được, và không code production nào (`src/`, `scripts/`) còn import hay nhắc hai tên công khai của stub — xóa xong mà sót tham chiếu là đỏ ngay thay vì vỡ runtime.
+` vì quy ước nộp file chỉ biết ghi nội dung, bất kỳ khối nào cũng tái tạo lại file mà hội đồng đã chốt xóa và làm guard dưới đây đỏ. Đã xác nhận `docs/ARCHITECTURE.md` và `README.md` không chứa tham chiếu nào tới registry. Guard đã kiểm chứng 3 trạng thái trên VM: file đã xóa → 3 passed; file còn → 3 fail; còn import treo → đúng test tham chiếu fail.
 
 [[FILE tests/test_fix_registry_dead_code.py]]
 """Regression guard for fix_registry_dead_code.
