@@ -7,6 +7,14 @@ engagement maximisation are implemented in pure Python so the module
 runs in CI. Every output is a suggestion with a confidence / interval;
 nothing here ever posts, likes, or otherwise acts on an account —
 auto-posting is explicitly out of scope.
+
+Fix (fix_import_dual_contracts_residual): exactly ONE import style
+for the contract — ``from src.contracts import ...`` run from the
+repo root. The old ``try/except ImportError`` fallback (``from
+contracts import``) is removed: a fallback can load the same file as
+a second, distinct module object (``contracts`` vs ``src.contracts``),
+so Enum/dataclass identity checks (``is``, ``isinstance``) silently
+break across modules.
 """
 from __future__ import annotations
 
@@ -18,16 +26,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
-try:
-    from src.contracts import (
-        Platform, Recommendation, UnifiedVideoMetric, Video, ViewForecast,
-        compute_engagement_rate, utcnow,
-    )
-except ImportError:
-    from contracts import (  # type: ignore
-        Platform, Recommendation, UnifiedVideoMetric, Video, ViewForecast,
-        compute_engagement_rate, utcnow,
-    )
+# DUY NHAT mot cach import contract: tu repo root. Khong fallback.
+from src.contracts import (
+    Platform, Recommendation, UnifiedVideoMetric, Video, ViewForecast,
+    compute_engagement_rate, utcnow,
+)
 
 __all__ = [
     "Cluster", "tokenize", "tfidf_vectors", "kmeans", "cluster_videos",
