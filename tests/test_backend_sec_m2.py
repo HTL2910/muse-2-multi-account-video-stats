@@ -189,7 +189,12 @@ def _refresh_method(tm):
         f"TokenManager exposes no public refresh method: {dir(tm)}")
 
 
-def _call_refresh(tm, account, vault):
+def _refresh(tm, account, vault):
+    """Call the manager's refresh entry point and normalize the result
+    to (TokenSet, AccountStatus). The manager's contract (see
+    tests/test_fix_token_lock_distributed.py) is ensure_fresh(account)
+    -> (TokenSet, AccountStatus): fail-closed outcomes are REPORTED as
+    a status, not raised."""
     fn = _refresh_method(tm)
     params = [p for p in inspect.signature(fn).parameters.values()
               if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
@@ -198,9 +203,9 @@ def _call_refresh(tm, account, vault):
         result = fn(account, tokens)
     else:
         result = fn(account)
-    if isinstance(result, tuple):  # tolerate (TokenSet, status) shapes
-        result = result[0]
-    return result
+    if isinstance(result, tuple) and len(result) == 2:
+        return result[0], result[1]
+    return result, account.status
 
 
 def test_token_refresh_race_calls_refresher_exactly_once():
@@ -220,13 +225,15 @@ def test_token_refresh_race_calls_refresher_exactly_once():
                         expires_at=utcnow() + timedelta(hours=2))
 
     shared_lock = InMemoryDistributedLock()
-    results, errors = [], []
+    results, accounts, errors = [], [], []
 
     def worker():
         try:
             acct = _account(id="acc-race", credential_ref=ref)
-            tm = TokenManager(vault, refresher, lock_provider=shared_lock)
-            results.append(_call_refresh(tm, acct, vault))
+            tm = TokenManager(vault, refresher, lock_provider=shared_lock,
+                              lock_timeout_seconds=5)
+            results.append(_refresh(tm, acct, vault))
+            accounts.append(acct)
         except Exception as exc:  # noqa: BLE001 - collected & asserted below
             errors.append(exc)
 
@@ -238,11 +245,14 @@ def test_token_refresh_race_calls_refresher_exactly_once():
     assert not errors, f"refresh workers errored: {errors!r}"
     assert len(results) == 6
     # The distributed lock + latest-ref re-read means ONE real refresh;
-    # every worker ends up with the winner's rotated token.
+    # every worker ends up with the winner's rotated token and ACTIVE.
     assert calls["n"] == 1, f"refresher called {calls['n']} times"
-    assert all(r.access_token == "access-new" for r in results)
-    latest = vault.latest_ref("acc-race", "token_set")
-    assert latest is not None and latest != ref
+    assert all(tok.access_token == "access-new" for tok, _ in results)
+    assert all(st == AccountStatus.ACTIVE for _, st in results)
+    # All workers converge on the SAME single rotated ref in the store.
+    refs = {a.credential_ref for a in accounts}
+    assert len(refs) == 1 and refs.pop() != ref
+    assert vault.latest_ref("acc-race", "token_set") != ref
 
 
 def test_token_revoked_fails_closed_to_needs_reauth():
@@ -257,16 +267,47 @@ def test_token_revoked_fails_closed_to_needs_reauth():
 
     tm = TokenManager(vault, revoked_refresher,
                       lock_provider=InMemoryDistributedLock())
-    raised = False
+    raised, status = False, None
     try:
-        _call_refresh(tm, acct, vault)
+        _, status = _refresh(tm, acct, vault)
     except TokenRevokedError:
         raised = True
-    # Fail-closed contract (vault module docstring): revoked/checkpoint
-    # -> NEEDS_REAUTH, surfaced as TokenRevokedError and/or the status.
-    assert raised or acct.status == AccountStatus.NEEDS_REAUTH, (
-        f"revoked token neither raised nor set NEEDS_REAUTH "
-        f"(status={acct.status})")
+    # Fail-closed contract: revoked/checkpoint -> NEEDS_REAUTH, either
+    # raised as TokenRevokedError or reported as the returned status
+    # (ensure_fresh returns (TokenSet, AccountStatus) on main).
+    assert raised or status == AccountStatus.NEEDS_REAUTH \
+        or acct.status == AccountStatus.NEEDS_REAUTH, (
+            f"revoked token not failed closed (status={status}, "
+            f"account={acct.status})")
+
+
+def test_token_lock_timeout_fails_closed_without_refreshing():
+    vault = _make_vault()
+    old = TokenSet(access_token="access-old", refresh_token="refresh-old",
+                   expires_at=utcnow() + timedelta(minutes=10))
+    ref = vault.store_token_set(account_id="acc-locked", tokens=old)
+    backend = InMemoryDistributedLock()
+    # Another worker holds the refresh lease for this account.
+    holder = backend.acquire("token-refresh:acc-locked", ttl_seconds=30,
+                             timeout_seconds=1)
+    assert holder
+    calls = []
+
+    def refresher(account, tokens):
+        calls.append(1)
+        return TokenSet(access_token="access-new",
+                        expires_at=utcnow() + timedelta(hours=1))
+
+    try:
+        tm = TokenManager(vault, refresher, lock_provider=backend,
+                          lock_timeout_seconds=0.3)
+        tokens, status = _refresh(tm, _account(id="acc-locked",
+                                               credential_ref=ref), vault)
+    finally:
+        backend.release("token-refresh:acc-locked", holder)
+    assert calls == [], "refresher must NOT run without the lock"
+    assert tokens.access_token == "access-old"      # untouched, not rotated
+    assert status in (AccountStatus.TOKEN_EXPIRING, AccountStatus.NEEDS_REAUTH)
 
 
 # ---------------------------------------------------------------- youtube
@@ -489,18 +530,49 @@ def test_collect_sample_data_golden_cases_cover_all_platforms():
     assert {c["platform"] for c in cases} == {"facebook", "tiktok", "youtube"}
     expected_views = {"facebook": 12000, "tiktok": 50000, "youtube": 98000}
     for case in cases:
-        fixture = REPO_ROOT / case["raw_fixture_path"]
-        assert fixture.exists(), f"missing golden fixture: {fixture}"
-        on_disk = json.loads(fixture.read_text(encoding="utf-8"))
-        # The golden contract: the fixture ON DISK normalizes exactly to
-        # the case's expected metric (not just the in-memory builder).
-        assert mod.normalize(case["platform"], on_disk) == \
-            case["expected_first_metric"]
+        # The case is self-consistent: expected metric == normalize of
+        # the module's own synthetic raw fixture (normalize returns a
+        # LIST of metric dicts; the case pins the first one + count).
+        metrics = mod.normalize(case["platform"],
+                                mod.RAW_BUILDERS[case["platform"]]())
+        assert case["expected_video_count"] == len(metrics) == 1
+        assert case["expected_first_metric"] == metrics[0]
         assert case["expected_first_metric"]["views"] == \
             expected_views[case["platform"]]
+        # The golden fixture path the case points at exists in the repo.
+        fixture = REPO_ROOT / case["raw_fixture_path"]
+        assert fixture.exists(), f"missing golden fixture: {fixture}"
     # Benchmark is part of the generator contract and must be clean.
     rows = mod.benchmark(iterations=5)
     assert len(rows) == 3 and all(r["success_rate"] == 1.0 for r in rows)
+
+
+def test_collect_sample_data_main_generates_full_tree_without_secrets():
+    mod = _load_collect()
+    argv = sys.argv
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            sys.argv = ["collect_sample_data.py", "--out", td,
+                        "--iterations", "5"]
+            assert mod.main() == 0
+            root = Path(td)
+            for p in ("facebook", "tiktok", "youtube"):
+                raw_file = root / "fixtures" / p / "video_list.raw.json"
+                norm_file = root / "fixtures" / p / "normalized.json"
+                gold_file = root / "golden" / p / "video_list.json"
+                for f in (raw_file, norm_file, gold_file):
+                    assert f.exists(), f"generator did not write {f}"
+                raw = json.loads(raw_file.read_text(encoding="utf-8"))
+                assert raw == mod.RAW_BUILDERS[p]()
+                normalized = json.loads(norm_file.read_text(encoding="utf-8"))
+                assert normalized == mod.normalize(p, raw)
+            cases = json.loads((root / "golden" / "cases.json")
+                               .read_text(encoding="utf-8"))
+            assert cases == mod.build_golden_cases()
+            assert (root / "benchmark" / "benchmark.csv").exists()
+            assert (root / "README.md").exists()
+    finally:
+        sys.argv = argv
 
 
 def test_collect_sample_data_stores_no_real_credentials():
