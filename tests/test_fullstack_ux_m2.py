@@ -10,6 +10,15 @@ fix_test_portability_stub_contracts:
   repo and ``test_contracts_are_real_and_locked`` proves it (module file is
   the repo's own file, CONTRACTS_VERSION is locked, PlatformAdapter carries
   the mandatory signatures).
+
+fix_contracts_version_stale_tests:
+- The lock test no longer hardcodes the contracts version inline. The
+  Team-Lead-locked version lives in ONE place in this file,
+  ``EXPECTED_CONTRACTS_VERSION`` (currently "1.1.0", locked by
+  fix_idempotency_hourly_bucket: hourly snapshot_key, CollectJob key by
+  scheduled minute). Convention: any PR that bumps CONTRACTS_VERSION
+  must update that constant in the SAME PR — a stale pin here turned
+  CI red for a contract change that was correct and approved.
 Run from repo root:  python -m pytest tests/test_fullstack_ux_m2.py -q
 """
 import inspect
@@ -59,15 +68,19 @@ from src.security.rbac_audit import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# SINGLE SOURCE for the locked contracts version in this suite.
+# Bump this constant in the same PR that bumps CONTRACTS_VERSION.
+EXPECTED_CONTRACTS_VERSION = "1.1.0"
+
 
 # --- Contract lock: real contracts, locked version, adapter signatures ------
 def test_contracts_are_real_and_locked():
     # The contracts module actually imported is THIS repo's src/contracts.py,
     # not a stub copied into a temp dir / site-packages / author machine.
     assert Path(contracts.__file__).resolve() == (REPO_ROOT / "src" / "contracts.py").resolve()
-    assert CONTRACTS_VERSION == "1.0.0"
+    assert CONTRACTS_VERSION == EXPECTED_CONTRACTS_VERSION
     # PlatformAdapter is a Protocol: all five mandatory methods must exist
-    # with the locked parameter names from contracts v1.0.0.
+    # with the locked parameter names from contracts v1.1.0.
     expected = {
         "authenticate": ["self", "account"],
         "check_alive": ["self", "account"],
@@ -79,7 +92,8 @@ def test_contracts_are_real_and_locked():
         fn = getattr(PlatformAdapter, method, None)
         assert fn is not None, f"PlatformAdapter.{method} missing from contracts"
         assert list(inspect.signature(fn).parameters) == params, (
-            f"PlatformAdapter.{method} signature drifted from contracts v1.0.0")
+            f"PlatformAdapter.{method} signature drifted from contracts "
+            f"v{EXPECTED_CONTRACTS_VERSION}")
     # list_videos keeps its locked keyword-only default.
     limit_param = inspect.signature(PlatformAdapter.list_videos).parameters["limit"]
     assert limit_param.default == 50
