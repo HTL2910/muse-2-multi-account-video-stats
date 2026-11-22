@@ -10,13 +10,45 @@ Tuan thu src/contracts.py: SecretVault Protocol (store/retrieve/rotate/
 delete), TokenSet, AccountStatus, TOKEN_REFRESH_BEFORE_MINUTES.
 Khong bao gio log/tra secret plaintext. Fail-closed: token revoked /
 checkpoint -> NEEDS_REAUTH, khong retry vo han.
+
+Fix ``fix_vault_kek_fallback_wipe`` (gop fix_vault_ephemeral_kek_and_
+silent_fallb + fix_vault_ephemeral_kek_data_loss +
+fix_vault_wipe_noop_and_aead_fallback) — FAIL-CLOSED o khoi dong:
+- EnvKekProvider KHONG con tu sinh KEK ngau nhien khi thieu
+  VAULT_KEK_B64: thieu KEK (va khong co kek truyen truc tiep) thi
+  raise VaultError ngay. KEK tam thoi (ephemeral) chi duoc tao khi
+  co co DEV_MODE ro rang (tham so ``dev_mode=True`` hoac env
+  VAULT_DEV_MODE=1 / DEV_MODE=1) kem canh bao co cau truc — va phai
+  hieu ro: ephemeral KEK chi song trong RAM, restart la MAT het
+  secret da luu bang no.
+- VAULT_KEK_B64 duoc validate nghiem: base64 hop le (validate=True)
+  va giai ma dung 32 byte, sai la raise VaultError ngay, khong cat
+  ngan/khong chap nhan KEK yeu.
+- Thieu thu vien ``cryptography`` va khong o DEV_MODE: khoi tao
+  EncryptedSecretVault raise VaultError; wrap/encrypt bang fallback
+  HMAC cung bi chan o EnvKekProvider. Neu DEV_MODE cho phep fallback
+  thi ban ghi mang dinh dang khac han: prefix wrap ``H1`` (thay
+  ``G1`` cua AES-GCM) va truong ``alg`` =
+  "hmac-sha256-stream-dev-fallback" (thay "aes-256-gcm"), kem log
+  warning co cau truc moi lan khoi tao.
+- ``_wipe``: DEK duoc giu dang bytearray tu dau va zero CHINH doi
+  tuong bytearray do trong finally (truoc day code goi
+  ``_wipe(bytearray(dek))`` — chi zero ban sao vua tao, DEK goc dang
+  bytes van nguyen). Gioi han trung thuc: viec zero chi xoa duoc
+  doi tuong bytearray ma code dang giu; cac ban sao da tao ra trong
+  qua trinh tinh toan (bytes(dek) dua cho AESGCM, internals cua
+  interpreter, swap/hibernation cua OS) nam ngoai kha nang kiem soat
+  — day la giam thieu ton du, KHONG phai cam ket xoa tuyet doi. KEK/
+  DEK dai han phai nam o KMS/HSM o production.
 """
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import threading
@@ -47,10 +79,35 @@ __all__ = [
     "VaultError", "TokenRevokedError", "KekProvider", "EnvKekProvider",
     "EncryptedRecord", "InMemoryVaultStore", "EncryptedSecretVault",
     "TokenManager", "mask_secret", "validate_cookie_blob",
+    "ALG_AES_GCM", "ALG_DEV_FALLBACK", "dev_mode_enabled",
 ]
 
 _KINDS = {"password", "cookie", "access_token", "refresh_token",
           "token_set", "totp_seed", "proxy_password", "session"}
+
+ALG_AES_GCM = "aes-256-gcm"
+ALG_DEV_FALLBACK = "hmac-sha256-stream-dev-fallback"
+
+_log = logging.getLogger("vault")
+
+
+def _structured_warning(event: str, **fields: object) -> None:
+    """Log warning dang JSON 1 dong (khong chua secret) de observability
+    bat duoc bang event thay vi doc van ban tu do."""
+    payload = {"level": "warning", "component": "vault", "event": event}
+    payload.update(fields)
+    _log.warning(json.dumps(payload, sort_keys=True))
+
+
+def dev_mode_enabled(explicit: Optional[bool] = None) -> bool:
+    """DEV_MODE chi bat khi duoc khai bao RO RANG: tham so explicit,
+    hoac env VAULT_DEV_MODE / DEV_MODE thuoc {1, true, yes, on}."""
+    if explicit is not None:
+        return bool(explicit)
+    for name in ("VAULT_DEV_MODE", "DEV_MODE"):
+        if os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+    return False
 
 
 class VaultError(RuntimeError):
@@ -76,6 +133,18 @@ def _b64d(s: str) -> bytes:
     return base64.urlsafe_b64decode(s.encode())
 
 
+def _decode_kek_b64(raw: str) -> bytes:
+    """Giai ma VAULT_KEK_B64 nghiem ngat: base64 hop le + dung 32 byte."""
+    try:
+        kek = base64.b64decode(raw.strip(), altchars=b"-_", validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise VaultError("VAULT_KEK_B64 is not valid base64") from exc
+    if len(kek) != 32:
+        raise VaultError(
+            f"VAULT_KEK_B64 must decode to exactly 32 bytes, got {len(kek)}")
+    return kek
+
+
 # ---------------------------------------------------------------- KEK
 class KekProvider(Protocol):
     def wrap(self, dek: bytes) -> bytes: ...
@@ -83,13 +152,44 @@ class KekProvider(Protocol):
 
 
 class EnvKekProvider:
-    """KEK tu env VAULT_KEK_B64 (32B) - dev/self-host. Prod dung KMS."""
+    """KEK tu env VAULT_KEK_B64 (32B) - dev/self-host. Prod dung KMS.
 
-    def __init__(self, kek: bytes | None = None):
-        self._kek = kek or _b64d(os.environ.get("VAULT_KEK_B64", "")) \
-            if os.environ.get("VAULT_KEK_B64") else (kek or os.urandom(32))
-        if len(self._kek) != 32:
-            raise VaultError("KEK must be 32 bytes")
+    Fail-closed: khong co KEK tu env va khong co ``kek`` truyen truc
+    tiep thi raise VaultError, TRU KHI dev_mode bat — khi do moi sinh
+    KEK tam thoi trong RAM (``self.ephemeral is True``) kem canh bao;
+    secret da luu bang KEK tam thoi se khong giai ma duoc sau restart.
+    """
+
+    def __init__(self, kek: bytes | None = None, *,
+                 dev_mode: Optional[bool] = None):
+        self.dev_mode = dev_mode_enabled(dev_mode)
+        self.ephemeral = False
+        raw = os.environ.get("VAULT_KEK_B64", "").strip()
+        if kek is not None:
+            if not isinstance(kek, (bytes, bytearray)) or len(kek) != 32:
+                raise VaultError("KEK must be exactly 32 bytes")
+            self._kek = bytes(kek)
+        elif raw:
+            self._kek = _decode_kek_b64(raw)
+        elif self.dev_mode:
+            self._kek = os.urandom(32)
+            self.ephemeral = True
+            _structured_warning(
+                "ephemeral_kek_generated",
+                reason="VAULT_KEK_B64 missing in DEV_MODE",
+                impact="secrets stored with this KEK are lost on restart")
+        else:
+            raise VaultError(
+                "VAULT_KEK_B64 not configured: refusing to start with an "
+                "ephemeral KEK (all secrets would be lost on restart). "
+                "Set VAULT_KEK_B64 to base64 of exactly 32 bytes, or set "
+                "VAULT_DEV_MODE=1 for throwaway dev/test use.")
+
+    def _require_aead_or_dev(self, op: str) -> None:
+        if not _HAS_AESGCM and not self.dev_mode:
+            raise VaultError(
+                f"cryptography/AESGCM missing: refusing to {op} with the "
+                "insecure HMAC fallback outside DEV_MODE")
 
     def _keystream_xor(self, nonce: bytes, data: bytes) -> bytes:
         out, counter = bytearray(), 0
@@ -102,9 +202,10 @@ class EnvKekProvider:
     def wrap(self, dek: bytes) -> bytes:
         if _HAS_AESGCM:
             nonce = os.urandom(12)
-            return b"G1" + nonce + AESGCM(self._kek).encrypt(nonce, dek, b"dek")
+            return b"G1" + nonce + AESGCM(self._kek).encrypt(nonce, bytes(dek), b"dek")
+        self._require_aead_or_dev("wrap DEK")
         nonce = os.urandom(16)
-        ct = self._keystream_xor(nonce, dek)
+        ct = self._keystream_xor(nonce, bytes(dek))
         tag = hmac.new(self._kek, b"wrap" + nonce + ct, hashlib.sha256).digest()
         return b"H1" + nonce + tag + ct
 
@@ -112,8 +213,13 @@ class EnvKekProvider:
         if wrapped[:2] == b"G1":
             if not _HAS_AESGCM:
                 raise VaultError("AESGCM record but cryptography missing")
-            return AESGCM(self._kek).decrypt(wrapped[2:14], wrapped[14:], b"dek")
+            try:
+                return AESGCM(self._kek).decrypt(wrapped[2:14], wrapped[14:], b"dek")
+            except Exception as exc:
+                raise VaultError(
+                    "KEK unwrap failed: wrong KEK or corrupted wrapped DEK") from exc
         if wrapped[:2] == b"H1":
+            self._require_aead_or_dev("unwrap fallback DEK")
             nonce, tag, ct = wrapped[2:18], wrapped[18:50], wrapped[50:]
             exp = hmac.new(self._kek, b"wrap" + nonce + ct, hashlib.sha256).digest()
             if not hmac.compare_digest(tag, exp):
@@ -126,7 +232,7 @@ class EnvKekProvider:
 def _aead_encrypt(dek: bytes, plaintext: bytes, aad: bytes) -> tuple[bytes, bytes]:
     if _HAS_AESGCM:
         nonce = os.urandom(12)
-        return nonce, AESGCM(dek).encrypt(nonce, plaintext, aad)
+        return nonce, AESGCM(bytes(dek)).encrypt(nonce, plaintext, aad)
     nonce = os.urandom(16)
     stream, counter = bytearray(), 0
     while len(stream) < len(plaintext):
@@ -138,9 +244,19 @@ def _aead_encrypt(dek: bytes, plaintext: bytes, aad: bytes) -> tuple[bytes, byte
     return nonce, tag + ct
 
 
-def _aead_decrypt(dek: bytes, nonce: bytes, blob: bytes, aad: bytes) -> bytes:
-    if blob and _HAS_AESGCM and len(nonce) == 12:
-        return AESGCM(dek).decrypt(nonce, blob, aad)
+def _aead_decrypt(dek: bytes, nonce: bytes, blob: bytes, aad: bytes,
+                  alg: str = "") -> bytes:
+    """Giai ma theo ``alg`` cua ban ghi. Ban ghi cu khong co alg thi
+    suy ra tu do dai nonce (12 = AES-GCM, 16 = fallback) nhu truoc."""
+    use_gcm = (alg == ALG_AES_GCM) if alg else (len(nonce) == 12)
+    if use_gcm:
+        if not _HAS_AESGCM:
+            raise VaultError("AESGCM record but cryptography missing")
+        try:
+            return AESGCM(bytes(dek)).decrypt(nonce, blob, aad)
+        except Exception as exc:
+            raise VaultError(
+                "decrypt failed: wrong DEK/KEK or data tampered") from exc
     tag, ct = blob[:32], blob[32:]
     exp = hmac.new(dek, b"data" + aad + nonce + ct, hashlib.sha256).digest()
     if not hmac.compare_digest(tag, exp):
@@ -164,6 +280,9 @@ class EncryptedRecord:
     ciphertext: str
     created_at: str
     rotated_from: str = ""
+    # Dinh dang ma hoa cua ban ghi: ALG_AES_GCM hoac ALG_DEV_FALLBACK.
+    # "" = ban ghi legacy (truoc fix nay) — giai ma suy tu nonce.
+    alg: str = ""
 
     def to_dict(self) -> dict:
         return dict(self.__dict__)
@@ -190,14 +309,36 @@ class InMemoryVaultStore:
 
 
 class EncryptedSecretVault:
-    """Implements contracts.SecretVault."""
+    """Implements contracts.SecretVault.
+
+    Fail-closed khi thieu ``cryptography``: neu AESGCM khong dung duoc
+    va khong o DEV_MODE (tham so ``allow_insecure_fallback`` / env
+    VAULT_DEV_MODE / DEV_MODE) thi __init__ raise VaultError — khong
+    bao gio am tham ghi secret bang fallback yeu hon. O DEV_MODE,
+    ``self.insecure_fallback`` = True va moi ban ghi moi mang
+    ``alg = ALG_DEV_FALLBACK`` de phan biet khoi AES-GCM that.
+    """
 
     def __init__(self, kek: KekProvider | None = None,
-                 store: InMemoryVaultStore | None = None):
+                 store: InMemoryVaultStore | None = None,
+                 *, allow_insecure_fallback: Optional[bool] = None):
         self._kek = kek or EnvKekProvider()
         self._store = store or InMemoryVaultStore()
         self._versions: dict[str, int] = {}
         self._lock = threading.Lock()
+        self.insecure_fallback = False
+        if not _HAS_AESGCM:
+            if not dev_mode_enabled(allow_insecure_fallback):
+                raise VaultError(
+                    "cryptography/AESGCM is required: refusing to run the "
+                    "vault on the insecure HMAC fallback outside DEV_MODE. "
+                    "Install cryptography, or set VAULT_DEV_MODE=1 for "
+                    "throwaway dev/test use.")
+            self.insecure_fallback = True
+            _structured_warning(
+                "insecure_fallback_enabled",
+                alg=ALG_DEV_FALLBACK,
+                impact="new records are NOT AES-256-GCM; dev/test only")
 
     # -- Protocol ----------------------------------------------------
     def store(self, *, account_id: str, kind: str, secret: str) -> str:
@@ -205,31 +346,44 @@ class EncryptedSecretVault:
             raise VaultError(f"unsupported secret kind: {kind}")
         if not account_id or not secret:
             raise VaultError("account_id and secret are required")
-        dek = os.urandom(32)
-        aad = f"{account_id}:{kind}".encode()
-        nonce, ct = _aead_encrypt(dek, secret.encode(), aad)
+        if not _HAS_AESGCM and not self.insecure_fallback:
+            # Phong thu lap 2 (vd _HAS_AESGCM bi thay doi sau khoi tao):
+            # khong ghi secret moi bang fallback khi chua duoc cho phep.
+            raise VaultError(
+                "AESGCM unavailable and insecure fallback not enabled: "
+                "refusing to store new secrets")
+        # DEK song dang bytearray tu dau de _wipe zero dung doi tuong nay.
+        dek = bytearray(os.urandom(32))
+        try:
+            aad = f"{account_id}:{kind}".encode()
+            nonce, ct = _aead_encrypt(dek, secret.encode(), aad)
+            wrapped = self._kek.wrap(dek)
+        finally:
+            _wipe(dek)
         with self._lock:
             ver = self._versions.get(f"{account_id}:{kind}", 0) + 1
             self._versions[f"{account_id}:{kind}"] = ver
         ref = f"vault://{account_id}/{kind}/v{ver}/{secrets.token_hex(6)}"
         self._store.put(EncryptedRecord(
             credential_ref=ref, account_id=account_id, kind=kind, version=ver,
-            wrapped_dek=_b64e(self._kek.wrap(dek)), nonce=_b64e(nonce),
-            ciphertext=_b64e(ct), created_at=utcnow().isoformat()))
-        _wipe(bytearray(dek))
+            wrapped_dek=_b64e(wrapped), nonce=_b64e(nonce),
+            ciphertext=_b64e(ct), created_at=utcnow().isoformat(),
+            alg=ALG_AES_GCM if _HAS_AESGCM else ALG_DEV_FALLBACK))
         return ref
 
     def retrieve(self, *, credential_ref: str) -> str:
         rec = self._store.get(credential_ref)
         if rec is None:
             raise VaultError("credential_ref not found")
-        dek = self._kek.unwrap(_b64d(rec.wrapped_dek))
+        # Cung nguyen tac bytearray + wipe dung doi tuong nhu store().
+        dek = bytearray(self._kek.unwrap(_b64d(rec.wrapped_dek)))
         try:
             pt = _aead_decrypt(dek, _b64d(rec.nonce), _b64d(rec.ciphertext),
-                               f"{rec.account_id}:{rec.kind}".encode())
+                               f"{rec.account_id}:{rec.kind}".encode(),
+                               alg=rec.alg)
             return pt.decode()
         finally:
-            _wipe(bytearray(dek))
+            _wipe(dek)
 
     def rotate(self, *, credential_ref: str, new_secret: str) -> str:
         old = self._store.get(credential_ref)
@@ -269,6 +423,15 @@ class EncryptedSecretVault:
 
 
 def _wipe(buf: bytearray) -> None:
+    """Zero CHINH doi tuong bytearray duoc truyen vao (khong phai ban sao).
+
+    Gioi han (doc ky truoc khi dua vao production): ham nay chi xoa
+    duoc vung nho cua dung doi tuong buf ma caller dang giu. Moi ban
+    sao da tao ra truoc do — bytes(buf) dua cho AESGCM, chuoi noi bo
+    cua trinh thong dich, ban ghi swap/hibernation cua he dieu hanh —
+    deu nam ngoai tam voi. Day la giam thieu ton du trong RAM, khong
+    phai cam ket xoa tuyet doi; khoa dai han phai o KMS/HSM.
+    """
     for i in range(len(buf)):
         buf[i] = 0
 
