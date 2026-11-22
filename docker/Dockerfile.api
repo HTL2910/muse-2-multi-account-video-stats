@@ -1,0 +1,26 @@
+# fix_docker_compose_companions — API image (compose service: api).
+# Multi-stage, non-root. CMD is the exact command the compose header
+# locked: uvicorn serving the FastAPI app from src/api/main.py.
+# No secrets are baked in: DATABASE_URL / vault key arrive via compose
+# environment + Docker secrets at runtime.
+FROM python:3.12-slim AS builder
+WORKDIR /build
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+# The repo has no requirements.txt yet (tracked separately); the API's
+# runtime deps are installed explicitly so this image builds today.
+RUN pip install --no-cache-dir \
+      fastapi "uvicorn[standard]" pydantic cryptography
+
+FROM python:3.12-slim AS runtime
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+COPY --from=builder /opt/venv /opt/venv
+WORKDIR /app
+COPY src/ ./src/
+RUN useradd --create-home --uid 10001 appuser \
+ && chown -R appuser:appuser /app
+USER appuser
+EXPOSE 8000
+CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

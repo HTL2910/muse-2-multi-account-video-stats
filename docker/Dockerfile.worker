@@ -1,0 +1,25 @@
+# fix_docker_compose_companions — worker image (compose services:
+# worker AND scheduler — the scheduler service overrides the command
+# with `python -m src.scheduler --beat`, see docker-compose.yml).
+# Multi-stage, non-root. The default CMD is the REAL worker loop in
+# src/worker/__main__.py (acquire -> execute -> finish via the
+# scheduler's worker API); an empty or placeholder CMD here is the
+# startup bug this fix exists to remove.
+FROM python:3.12-slim AS builder
+WORKDIR /build
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install --no-cache-dir \
+      fastapi "uvicorn[standard]" pydantic cryptography
+
+FROM python:3.12-slim AS runtime
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+COPY --from=builder /opt/venv /opt/venv
+WORKDIR /app
+COPY src/ ./src/
+RUN useradd --create-home --uid 10001 appuser \
+ && chown -R appuser:appuser /app
+USER appuser
+CMD ["python", "-m", "src.worker"]

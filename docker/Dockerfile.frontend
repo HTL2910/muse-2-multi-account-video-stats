@@ -1,0 +1,23 @@
+# fix_docker_compose_companions — frontend image (compose service:
+# frontend). Multi-stage: build src/web (Next.js, manifest from
+# src/web/package.json) in the builder, serve with `next start` as the
+# non-root `node` user in the runtime stage.
+# The repo has no package-lock.json yet, so the build uses
+# `npm install`; switch to `npm ci` once a lockfile is committed.
+FROM node:20-alpine AS builder
+WORKDIR /web
+COPY src/web/package.json ./
+RUN npm install --no-audit --no-fund
+COPY src/web/ ./
+RUN npm run build
+
+FROM node:20-alpine AS runtime
+WORKDIR /web
+ENV NODE_ENV=production
+COPY --from=builder /web/package.json ./package.json
+COPY --from=builder /web/node_modules ./node_modules
+COPY --from=builder /web/.next ./.next
+COPY --from=builder /web/pages ./pages
+USER node
+EXPOSE 3000
+CMD ["npm", "run", "start"]
