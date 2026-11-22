@@ -1,13 +1,20 @@
 """Tests for expert/systems-arch-m2 (approach_01,05,09,13,17).
-Run: /tmp/m2/venv/bin/python -m pytest tests -q  (from /tmp/m2)
-Uses the local stub contracts.py — real contracts.py on main has the
-same fields/signatures; CI must re-run against main.
+Run: pytest tests/test_systems_arch_m2.py -q  (from repo root)
+
+Fix ``fix_scheduler_dead_letter_test_clock``: test dead-letter dung
+FakeClock inject duoc (xem ``_FakeClock``) thay vi dong ho that —
+test cu gia dinh retry duoc acquire lai ngay, xung dot voi fix
+``fix_scheduler_scheduled_at_lost`` da khoa (``pop_due`` chi tra job
+DA TOI HAN). Dac ta retry da do: job chay toi da 3 lan tong cong
+truoc khi vao dead-letter (``can_retry = attempts < MAX_JOB_RETRIES``,
+``attempts`` chi tang trong ``acquire_job``).
 """
-import json, sys
+import json, random, sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.contracts import (AccountStatus, BatchDecision, CollectJob, DataQuality,
+from src.contracts import (MAX_JOB_RETRIES, AccountStatus, BatchDecision, CollectJob, DataQuality,
     GoldenCase, JobPriority, JobStatus, JobType, MetricSource, Platform,
     PlatformAccount, ProxyInfo, ProxyStatus, TokenSet, UnifiedVideoMetric,
     Video, utcnow)
@@ -102,22 +109,65 @@ def test_golden_facebook_fixture():
     assert m.views == 100 and m.likes == 5
 
 # approach_09
+class _FakeClock:
+    """Clock dieu khien duoc cho test scheduler: tra ve thoi gian gia
+    lap, tua duoc qua backoff retry. TaskSchedulerImpl + PriorityQueue
+    dung chung clock nay nen pop_due() va scheduled_at retry cung mot
+    moc thoi gian (xem fix_scheduler_scheduled_at_lost)."""
+
+    def __init__(self, now):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, delta):
+        self.now += delta
+
 def test_scheduler_priority_and_dedup_and_dead_letter():
-    s = TaskSchedulerImpl(workers=["worker-1"], rng=__import__("random").Random(0))
+    # Viet lai theo fix_scheduler_dead_letter_test_clock: test cu gia
+    # dinh retry duoc acquire lai ngay, xung dot voi fix scheduled_at
+    # da khoa (pop_due chi tra job DA TOI HAN). Dac ta da do (khong sua
+    # nguong): job chay toi da 3 lan tong cong truoc khi vao dead-letter
+    # (can_retry = attempts < MAX_JOB_RETRIES, attempts chi tang trong
+    # acquire_job) — "retry toi da 3 lan" trong docstring scheduler noi
+    # ve 3 lan chay nay, khong phai 3 lan retry sau lan chay dau.
+    t0 = datetime(2026, 11, 22, 10, 0, tzinfo=timezone.utc)
+    clock = _FakeClock(t0)
+    s = TaskSchedulerImpl(workers=["worker-1"], rng=random.Random(0), clock=clock)
     s.account_status["acc1"] = AccountStatus.ACTIVE
-    job = CollectJob(id="j1", job_type=JobType.FETCH_STATS, account_id="acc1", platform=Platform.FACEBOOK)
+    job = CollectJob(id="j1", job_type=JobType.FETCH_STATS, account_id="acc1",
+                     platform=Platform.FACEBOOK, scheduled_at=t0)
     assert s.enqueue(job).status == JobStatus.PENDING
-    job2 = CollectJob(id="j2", job_type=JobType.FETCH_STATS, account_id="acc1", platform=Platform.FACEBOOK)
+    # j2 tach rieng: video_id + scheduled_at khac (phut khac) nen khong
+    # bi dedup, va hen xa tuong lai (+1h) nen khong canh tranh acquire
+    # trong vong doi cua j1.
+    job2 = CollectJob(id="j2", job_type=JobType.FETCH_STATS, account_id="acc1",
+                      platform=Platform.FACEBOOK, video_id="vid-2",
+                      scheduled_at=t0 + timedelta(hours=1))
     assert s.enqueue(job2).status == JobStatus.PENDING
+    assert len(s.queues[Platform.FACEBOOK]) == 2
     got = s.acquire_job(worker_id="worker-1", platform=Platform.FACEBOOK)
-    assert got is not None and got.status == JobStatus.RUNNING
-    # retry 3x -> dead letter (moi lan worker phai acquire lai, attempts tang o acquire)
+    assert got is not None and got.id == "j1" and got.status == JobStatus.RUNNING
+    # Moi lan worker phai acquire lai, attempts tang o acquire; sau moi
+    # lan fail, job RETRYING voi scheduled_at = now + backoff (toi da
+    # 2**attempts*5s) nen phai tua clock qua backoff moi acquire lai duoc.
     st = None
-    for _ in range(3):
-        got = s.acquire_job(worker_id="worker-1", platform=Platform.FACEBOOK) or got
+    for _ in range(MAX_JOB_RETRIES + 2):
         st = s.finish_job(got, ok=False, error="x")
+        if st == JobStatus.DEAD_LETTER:
+            break
+        clock.advance(timedelta(seconds=60))
+        got = s.acquire_job(worker_id="worker-1", platform=Platform.FACEBOOK)
+        assert got is not None, "retry job phai acquire lai duoc sau backoff"
+        assert got.id == "j1"
+    else:
+        raise AssertionError("job khong vao DEAD_LETTER trong gioi han vong lap")
     assert st == JobStatus.DEAD_LETTER
+    assert got.attempts == MAX_JOB_RETRIES
     assert len(s.dead_letter.list()) == 1
+    # j2 van nguyen trong queue, khong bi anh huong boi vong doi cua j1.
+    assert len(s.queues[Platform.FACEBOOK]) == 1
     back = s.requeue_dead_letter(got.id)
     assert back.status == JobStatus.PENDING
 
