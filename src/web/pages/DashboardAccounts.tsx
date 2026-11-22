@@ -1,10 +1,29 @@
 /**
  * approach_12 — Dashboard UX: multi-account overview + video detail.
  *
- * Stack (approach_13 contract): Next.js + TypeScript, TanStack Query for
- * server state, SSE (/api/events) for realtime, cursor pagination.
- * 4 screens: Accounts | Overview | Videos | Proxies+Jobs.
- * Types mirror src/contracts.py (Platform, AccountStatus, UnifiedVideoMetric).
+ * SINGLE frontend<->backend contract (fix_frontend_backend_contract_mismatch):
+ * the source of truth is the FastAPI backend's OpenAPI (approach_13,
+ * src/api/main.py — /openapi.json, /docs). This file is aligned to it:
+ * - Routes live at the ROOT (no /api or /api/v1 prefix): /accounts,
+ *   /videos, /jobs, /proxies, /proxies/health, /ws/events.
+ * - GET /accounts REQUIRES ?workspace_id=... (taken from the page URL,
+ *   default "default"); empty platform/status filters are omitted
+ *   (FastAPI enums reject empty strings).
+ * - Row types below mirror the OpenAPI response schemas EXACTLY
+ *   (AccountOut, the /videos item dict, the /jobs item dict, Page).
+ *   Fields the backend does not return (avatar_url, tags, group_ids, a
+ *   joined proxy object, per-video view counts in the list) are NOT read
+ *   here — video numbers come from GET /videos/{id}/metrics.
+ * - Endpoints that do not exist are not called: no /analytics/overview
+ *   (Overview aggregates the list endpoints client-side), no
+ *   /export/*.xlsx (CSV export is client-side), no POST /jobs/{id}/retry,
+ *   no POST /accounts/{id}/tags.
+ * - Realtime is the backend's WebSocket /ws/events (there is no SSE
+ *   endpoint); EventSource is not used.
+ * - Bulk assign-proxy sends the body the backend requires,
+ *   { "proxy_id": <first ACTIVE proxy id> }.
+ * When the backend contract changes, regenerate types from /openapi.json
+ * (e.g. openapi-typescript) instead of editing these interfaces by hand.
  * No secret is ever rendered: the API returns credential *metadata* only.
  */
 import React, { useEffect, useMemo, useRef, useState } from "react";
@@ -16,22 +35,36 @@ export type AccountStatus =
   | "needs_review" | "needs_reauth" | "checkpoint" | "captcha_required"
   | "token_expired" | "rate_limited" | "banned" | "disabled" | "suspended";
 
+/** Mirrors backend AccountOut (src/api/main.py) — no more, no less. */
 export interface AccountRow {
-  id: string; platform: Platform; display_name: string; avatar_url: string;
-  status: AccountStatus; health_score: number; tags: string[]; group_ids: string[];
-  proxy: { ip: string; country: string; latency_ms: number; status: string } | null;
-  last_sync_at: string | null;
+  id: string; workspace_id: string; platform: Platform; platform_user_id: string;
+  display_name: string; status: AccountStatus; health_score: number;
+  proxy_binding_id: string | null; last_sync_at: string | null;
 }
+/** Mirrors the item dict of GET /videos. Metrics live under /videos/{id}/metrics. */
 export interface VideoRow {
-  id: string; account_id: string; platform: Platform; title: string;
-  thumbnail_url: string; url: string; views: number; likes: number;
-  comments: number; shares: number; velocity_per_hour: number; published_at: string;
+  id: string; account_id: string; platform: Platform; platform_video_id: string;
+  title: string; url: string; published_at: string | null; status: string;
 }
+/** Mirrors the item dict of GET /videos/{video_id}/metrics. */
+export interface MetricPoint {
+  video_id: string; date_bucket: string; views: number; likes: number;
+  comments: number; shares: number; watch_time_seconds: number; collected_at: string;
+}
+/** Mirrors the job dicts stored by the backend (GET /jobs items). */
 export interface JobRow {
-  id: string; job_type: string; account_id: string; status: string;
-  attempts: number; last_error: string;
+  id: string; job_type: string; account_id: string; status: string; created_at: string;
 }
-interface Page<T> { items: T[]; next_cursor: string | null; total: number | null }
+/** Mirrors the item dict of GET /proxies. */
+export interface ProxyRow {
+  id: string; host: string; port: number; country: string; status: string; score: number;
+}
+/** Mirrors one entry of GET /proxies/health (a bare array, not a Page). */
+export interface ProxyHealth {
+  id: string; status: string; success_rate: number;
+  avg_latency_ms: number; consecutive_failures: number;
+}
+interface Page<T> { items: T[]; next_cursor: string | null; total: number }
 
 const STATUS_COLOR: Record<AccountStatus, string> = {
   active: "#16a34a", verified: "#16a34a", created: "#64748b",
@@ -44,18 +77,31 @@ const FAIL_CLOSED: AccountStatus[] = ["checkpoint", "captcha_required",
   "token_expired", "needs_reauth", "banned", "disabled", "suspended"];
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...init });
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  try { // the gateway requires a Bearer JWT (approach_13/16); attach when present
+    const token = window.localStorage.getItem("access_token");
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+  } catch { /* storage unavailable (SSR/tests) — request goes out unauthenticated */ }
+  const res = await fetch(path, { headers, ...init });
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
   return res.json() as Promise<T>;
 }
 const fmt = (n: number) => new Intl.NumberFormat("en", { notation: "compact" }).format(n);
 
+/** workspace_id is mandatory for GET /accounts: ?workspace_id= in the page URL, else "default". */
+function currentWorkspaceId(): string {
+  if (typeof window === "undefined") return "default";
+  return new URLSearchParams(window.location.search).get("workspace_id") ?? "default";
+}
+
 function useEventStream(onEvent: () => void) {
   const ref = useRef(onEvent); ref.current = onEvent;
   useEffect(() => {
-    const es = new EventSource("/api/events"); // SSE: account_status_changed | sync_completed | alert
-    es.onmessage = () => ref.current();
-    return () => es.close();
+    // Backend realtime is WebSocket /ws/events ONLY (no SSE endpoint exists).
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${proto}//${window.location.host}/ws/events`);
+    ws.onmessage = () => ref.current(); // account_status_changed | sync_completed | alert
+    return () => ws.close();
   }, []);
 }
 
@@ -66,11 +112,24 @@ function BulkBar({ selected, onClear }: { selected: Set<string>; onClear: () => 
     mutationFn: async (action: string) => {
       const ids = [...selected];
       if (!window.confirm(`${action}: áp dụng cho ${ids.length} account?`)) throw new Error("cancelled");
+      // assign-proxy REQUIRES a body {proxy_id} (backend 404/409 otherwise):
+      // pick the first ACTIVE proxy from GET /proxies, fail per-item if none.
+      let proxyId: string | null = null;
+      if (action === "assign-proxy") {
+        const proxies = await api<Page<ProxyRow>>("/proxies?limit=200");
+        proxyId = proxies.items.find((p) => p.status === "active")?.id ?? null;
+      }
       const results: Record<string, string> = {};
       let done = 0;
       for (const id of ids) { // per-item result, one failure never aborts the batch
         try {
-          await api(`/api/accounts/${id}/${action}`, { method: "POST" });
+          if (action === "assign-proxy") {
+            if (!proxyId) throw new Error("no ACTIVE proxy available");
+            await api(`/accounts/${id}/assign-proxy`,
+              { method: "POST", body: JSON.stringify({ proxy_id: proxyId }) });
+          } else {
+            await api(`/accounts/${id}/${action}`, { method: "POST" });
+          }
           results[id] = "ok";
         } catch (e) { results[id] = String(e); }
         setProgress(`${action}: ${++done}/${ids.length}`);
@@ -86,11 +145,6 @@ function BulkBar({ selected, onClear }: { selected: Set<string>; onClear: () => 
       <button onClick={() => bulk.mutate("check-alive")}>Check alive</button>
       <button onClick={() => bulk.mutate("sync-videos")}>Sync</button>
       <button onClick={() => bulk.mutate("assign-proxy")}>Gán proxy</button>
-      <button onClick={() => {
-        const tag = window.prompt("Tag:"); if (tag)
-          selected.forEach((id) => api(`/api/accounts/${id}/tags`, {
-            method: "POST", body: JSON.stringify({ tag }) }));
-      }}>Gán tag</button>
       <button onClick={onClear}>Bỏ chọn</button>
     </div>
   );
@@ -101,8 +155,13 @@ function AccountsScreen() {
   const [q, setQ] = useState(""); const [selected, setSelected] = useState<Set<string>>(new Set());
   const query = useQuery({
     queryKey: ["accounts", platform, status, q],
-    queryFn: () => api<Page<AccountRow>>(
-      `/api/accounts?limit=200&platform=${platform}&status=${status}&search=${encodeURIComponent(q)}`),
+    queryFn: () => {
+      const params = new URLSearchParams({ workspace_id: currentWorkspaceId(), limit: "200" });
+      if (platform) params.set("platform", platform); // omit empty: FastAPI enums reject ""
+      if (status) params.set("status", status);
+      if (q) params.set("search", q);
+      return api<Page<AccountRow>>(`/accounts?${params.toString()}`);
+    },
   });
   useEventStream(() => query.refetch());
   const rows = query.data?.items ?? [];
@@ -135,13 +194,13 @@ function AccountsScreen() {
               <input type="checkbox" checked={selected.has(a.id)} onChange={() => toggle(a.id)} />
               <span title={a.status} style={{ width: 10, height: 10, borderRadius: 5,
                 background: STATUS_COLOR[a.status] }} />
-              <span>{a.platform} · {a.display_name || a.id}
+              <span>{a.platform} · {a.display_name || a.platform_user_id}
                 {FAIL_CLOSED.includes(a.status) && <em> (fail-closed: job tự động đã dừng)</em>}</span>
-              {a.proxy
-                ? <span>🌐 {a.proxy.ip} · {a.proxy.country} · {a.proxy.latency_ms}ms</span>
+              {a.proxy_binding_id
+                ? <span>🌐 proxy bound</span>
                 : <span style={{ color: "#dc2626" }}>no proxy</span>}
               <span>health {(a.health_score * 100).toFixed(0)}%</span>
-              <span>{a.tags.join(", ")}</span>
+              <span>{a.last_sync_at ? `sync ${a.last_sync_at.slice(0, 10)}` : "never synced"}</span>
             </div>))}
         </div>
       </div>
@@ -157,57 +216,68 @@ function Sparkline({ points }: { points: number[] }) {
 }
 
 function OverviewScreen() {
-  const kpi = useQuery({ queryKey: ["kpi"], queryFn: () => api<{
-    views: number; likes: number; comments: number;
-    by_platform: Record<Platform, number[]>; top_videos: VideoRow[];
-  }>("/api/analytics/overview") });
-  useEventStream(() => kpi.refetch());
-  if (!kpi.data) return <p>Đang tải…</p>;
+  // No /analytics/overview endpoint exists: aggregate the real list
+  // endpoints client-side (totals come from each Page's `total`).
+  const accounts = useQuery({ queryKey: ["overview-accounts"], queryFn: () =>
+    api<Page<AccountRow>>(`/accounts?workspace_id=${encodeURIComponent(currentWorkspaceId())}&limit=1`) });
+  const videos = useQuery({ queryKey: ["overview-videos"], queryFn: () =>
+    api<Page<VideoRow>>("/videos?limit=200") });
+  const health = useQuery({ queryKey: ["overview-proxy-health"], queryFn: () =>
+    api<ProxyHealth[]>("/proxies/health") });
+  const jobs = useQuery({ queryKey: ["overview-jobs"], queryFn: () =>
+    api<Page<JobRow>>("/jobs?limit=200") });
+  useEventStream(() => { accounts.refetch(); videos.refetch(); jobs.refetch(); });
+  const failedJobs = (jobs.data?.items ?? []).filter((j) =>
+    ["failed", "dead_letter", "retrying"].includes(j.status)).length;
+  const healthyProxies = (health.data ?? []).filter((p) => p.status === "active").length;
   return (
     <section>
       <div style={{ display: "flex", gap: 16 }}>
-        <div>Views<strong>{fmt(kpi.data.views)}</strong></div>
-        <div>Likes<strong>{fmt(kpi.data.likes)}</strong></div>
-        <div>Comments<strong>{fmt(kpi.data.comments)}</strong></div>
+        <div>Accounts<strong>{accounts.data?.total ?? "…"}</strong></div>
+        <div>Videos<strong>{videos.data?.total ?? "…"}</strong></div>
+        <div>Proxy active<strong>{healthyProxies}/{(health.data ?? []).length}</strong></div>
+        <div>Job lỗi<strong>{failedJobs}</strong></div>
       </div>
-      {(Object.keys(kpi.data.by_platform) as Platform[]).map((p) => (
-        <div key={p}>{p}<Sparkline points={kpi.data!.by_platform[p]} /></div>))}
-      <h3>Top video tăng trưởng nhanh</h3>
-      <ol>{kpi.data.top_videos.map((v) => (
-        <li key={v.id}>{v.title} — {fmt(v.views)} views · {fmt(v.velocity_per_hour)}/h</li>))}</ol>
+      <h3>Video mới nhất</h3>
+      <ol>{(videos.data?.items ?? []).slice(0, 10).map((v) => (
+        <li key={v.id}>{v.title || v.platform_video_id} — {v.platform}
+          {v.published_at ? ` · ${v.published_at.slice(0, 10)}` : ""}</li>))}</ol>
     </section>
   );
 }
 
 function VideosScreen() {
-  const [sort, setSort] = useState("views"); const [openId, setOpenId] = useState<string>("");
-  const videos = useQuery({ queryKey: ["videos", sort], queryFn: () =>
-    api<Page<VideoRow>>(`/api/videos?limit=200&sort=${sort}`) });
+  const [sort, setSort] = useState("newest"); const [openId, setOpenId] = useState<string>("");
+  const videos = useQuery({ queryKey: ["videos"], queryFn: () =>
+    api<Page<VideoRow>>("/videos?limit=200") });
   const history = useQuery({ queryKey: ["history", openId], enabled: !!openId, queryFn: () =>
-    api<{ views: number }[]>(`/api/videos/${openId}/metrics`) });
-  const exportCsv = () => { // CSV client-side; Excel export goes through /api/export (audited)
-    const rows = videos.data?.items ?? [];
-    const csv = ["title,platform,views,likes,comments,shares,velocity_per_hour",
-      ...rows.map((v) => [v.title, v.platform, v.views, v.likes, v.comments, v.shares,
-        v.velocity_per_hour].join(","))].join("\n");
+    api<Page<MetricPoint>>(`/videos/${openId}/metrics?limit=200`) });
+  const rows = useMemo(() => { // /videos has no sort param: sort client-side
+    const items = [...(videos.data?.items ?? [])];
+    if (sort === "title") items.sort((x, y) => x.title.localeCompare(y.title));
+    else items.sort((x, y) => (y.published_at ?? "").localeCompare(x.published_at ?? ""));
+    return items;
+  }, [videos.data, sort]);
+  const exportCsv = () => { // CSV client-side (no /export endpoint exists on the backend)
+    const csv = ["title,platform,platform_video_id,published_at,url",
+      ...rows.map((v) => [v.title, v.platform, v.platform_video_id,
+        v.published_at ?? "", v.url].join(","))].join("\n");
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" })); a.download = "videos.csv"; a.click();
   };
   return (
     <section>
       <label>Sort <select value={sort} onChange={(e) => setSort(e.target.value)}>
-        <option value="views">views</option><option value="velocity">velocity</option>
-        <option value="likes">likes</option></select></label>
+        <option value="newest">newest</option><option value="title">title</option>
+      </select></label>
       <button onClick={exportCsv}>Export CSV</button>
-      <button onClick={() => api("/api/export/videos.xlsx", { method: "POST" })}>Export Excel</button>
-      {(videos.data?.items ?? []).map((v) => (
+      {rows.map((v) => (
         <div key={v.id} style={{ display: "flex", gap: 10 }}>
-          <img src={v.thumbnail_url} alt="" width={96} height={54} loading="lazy" />
-          <button onClick={() => setOpenId(v.id)}>{v.title}</button>
-          <span>{fmt(v.views)} views · {fmt(v.velocity_per_hour)}/h</span>
+          <button onClick={() => setOpenId(v.id)}>{v.title || v.platform_video_id}</button>
+          <span>{v.platform} · {v.published_at ? v.published_at.slice(0, 10) : ""}</span>
           <a href={v.url} target="_blank" rel="noreferrer">Xem gốc ↗</a>
           {openId === v.id && history.data &&
-            <Sparkline points={history.data.map((m) => m.views)} />}
+            <Sparkline points={history.data.items.map((m) => m.views)} />}
         </div>))}
     </section>
   );
@@ -215,25 +285,21 @@ function VideosScreen() {
 
 function ProxiesJobsScreen() {
   const jobs = useQuery({ queryKey: ["jobs"], queryFn: () =>
-    api<Page<JobRow>>("/api/jobs?status=failed,dead_letter,retrying&limit=200") });
-  const qc = useQueryClient();
-  const retry = useMutation({ mutationFn: (id: string) =>
-    api(`/api/jobs/${id}/retry`, { method: "POST" }),
-    onSettled: () => qc.invalidateQueries({ queryKey: ["jobs"] }) });
+    api<Page<JobRow>>("/jobs?limit=200") }); // backend filters by account_id only
   const proxies = useQuery({ queryKey: ["proxies"], queryFn: () =>
-    api<Page<{ id: string; address: string; country: string; score: number; status: string }>>
-      ("/api/proxies?limit=200") });
+    api<Page<ProxyRow>>("/proxies?limit=200") });
+  const jobRows = jobs.data?.items ?? [];
+  const failed = jobRows.filter((j) => ["failed", "dead_letter", "retrying"].includes(j.status));
+  const shownJobs = failed.length > 0 ? failed : jobRows; // status filter is client-side
   return (
     <section>
       <h3>Proxy Manager</h3>
       {(proxies.data?.items ?? []).map((p) => (
-        <div key={p.id}>{p.address} · {p.country} · score {p.score.toFixed(2)} · {p.status}</div>))}
+        <div key={p.id}>{p.host}:{p.port} · {p.country} · score {p.score.toFixed(2)} · {p.status}</div>))}
       <h3>Job Monitor — failed / dead-letter</h3>
-      <button onClick={() => (jobs.data?.items ?? []).forEach((j) => retry.mutate(j.id))}>
-        Retry tất cả</button>
-      {(jobs.data?.items ?? []).map((j) => (
-        <div key={j.id}>{j.job_type} · account {j.account_id} · attempts {j.attempts} · {j.last_error}
-          <button onClick={() => retry.mutate(j.id)}>Retry</button></div>))}
+      {shownJobs.map((j) => (
+        <div key={j.id}>{j.job_type} · account {j.account_id} · {j.status} · {j.created_at}</div>))}
+      {jobRows.length === 0 && <p>Chưa có job nào.</p>}
     </section>
   );
 }
