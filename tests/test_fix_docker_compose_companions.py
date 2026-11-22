@@ -14,12 +14,22 @@ so all of that stayed green — these tests check the FILES.
 Stdlib-only except the optional YAML parse and the optional real
 `docker compose config` (both skip when the tool is absent, like the
 sibling test_fix_docker_compose_unrunnable).
+
+Windows CI note: the init_secrets test runs the script through the
+bash found on PATH (Git Bash/MSYS on the Windows runner). That bash
+cannot open a backslash Windows path (C:\\Users\\...) — the first CI
+run failed with "/bin/bash: C:\\...\\init_secrets.sh: No such file or
+directory" (exit 127) — so the test converts the path to POSIX form
+(/c/Users/...) and writes the script with LF line endings regardless
+of the checkout's autocrlf setting. The chmod-600 mode assertion is
+POSIX-only: Windows filesystems do not carry POSIX mode bits.
 Run from repo root:  python -m pytest tests/test_fix_docker_compose_companions.py -q
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -141,26 +151,51 @@ def test_worker_once_without_executor_idles_and_exits_clean():
 
 
 # --- init_secrets.sh really creates what compose expects ---------------------
+def _bash_path(path: Path) -> str:
+    """Path in the form the bash on PATH understands.
+
+    POSIX: unchanged. Windows (Git Bash/MSYS): C:\\Users\\x\\f.sh and
+    even C:/Users/x/f.sh are not openable by that bash — it wants the
+    MSYS form /c/Users/x/f.sh.
+    """
+    s = path.as_posix()
+    if os.name == "nt" and re.match(r"^[A-Za-z]:/", s):
+        s = "/" + s[0].lower() + s[2:]
+    return s
+
+
+def _run_init_secrets(script: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", _bash_path(script)],
+        capture_output=True, text=True, timeout=60)
+
+
 def test_init_secrets_creates_all_secret_files_mode_600(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash chua co o moi truong nay")
     scripts_dir = tmp_path / "scripts"
     scripts_dir.mkdir()
-    shutil.copy(INIT_SECRETS, scripts_dir / "init_secrets.sh")
-    result = subprocess.run(
-        ["bash", str(scripts_dir / "init_secrets.sh")],
-        capture_output=True, text=True, timeout=60)
+    # Write the script with LF endings explicitly: a Windows checkout
+    # with core.autocrlf=true would otherwise hand bash a CRLF script.
+    script = scripts_dir / "init_secrets.sh"
+    script.write_text(
+        INIT_SECRETS.read_bytes().decode("utf-8").replace("\r\n", "\n"),
+        encoding="utf-8", newline="\n")
+    result = _run_init_secrets(script)
     assert result.returncode == 0, result.stderr
     secrets_dir = tmp_path / ".secrets"
     first_contents = {}
     for name in SECRET_NAMES:
         target = secrets_dir / f"{name}.txt"
         assert target.is_file() and target.read_text(encoding="utf-8").strip()
-        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+        if os.name != "nt":
+            # POSIX mode bits only exist on POSIX filesystems; on
+            # Windows the chmod in the script is a no-op by design.
+            assert stat.S_IMODE(target.stat().st_mode) == 0o600
         first_contents[name] = target.read_text(encoding="utf-8")
     # Re-running must NOT rotate existing secrets (rotating the vault
     # master key would orphan every encrypted credential).
-    result2 = subprocess.run(
-        ["bash", str(scripts_dir / "init_secrets.sh")],
-        capture_output=True, text=True, timeout=60)
+    result2 = _run_init_secrets(script)
     assert result2.returncode == 0, result2.stderr
     for name in SECRET_NAMES:
         assert (secrets_dir / f"{name}.txt").read_text(encoding="utf-8") == first_contents[name]

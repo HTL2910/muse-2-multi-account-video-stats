@@ -1,6 +1,6 @@
 # Sửa lỗi `fix/fix_docker_compose_companions`: Commit đủ file đi kèm để docker compose chạy được một lệnh
 
-_fullstack-ux · Chuyên gia Ứng dụng & Tích hợp · lần nộp 1_
+_fullstack-ux · Chuyên gia Ứng dụng & Tích hợp · lần nộp 2_
 
 ## Việc được giao
 
@@ -8,38 +8,8 @@ Gộp fix_dockerfiles_scheduler_entrypoint_mis (muse) + fix_docker_compose_compa
 
 ## Bài làm
 
-(đã nộp file `docker/docker-compose.yml`)
-
-(đã nộp file `docker/Dockerfile.api`)
-
-(đã nộp file `docker/Dockerfile.worker`)
-
-(đã nộp file `docker/Dockerfile.frontend`)
-
-(đã nộp file `src/scheduler/__init__.py`)
-
-(đã nộp file `src/scheduler/__main__.py`)
-
-(đã nộp file `src/worker/__init__.py`)
-
-(đã nộp file `src/worker/__main__.py`)
-
-(đã nộp file `scripts/init_secrets.sh`)
-
-(đã nộp file `.gitignore`)
-
 (đã nộp file `tests/test_fix_docker_compose_companions.py`)
 
 ## File đã nộp
 
-- `docker/docker-compose.yml`
-- `docker/Dockerfile.api`
-- `docker/Dockerfile.worker`
-- `docker/Dockerfile.frontend`
-- `src/scheduler/__init__.py`
-- `src/scheduler/__main__.py`
-- `src/worker/__init__.py`
-- `src/worker/__main__.py`
-- `scripts/init_secrets.sh`
-- `.gitignore`
 - `tests/test_fix_docker_compose_companions.py`
