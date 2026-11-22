@@ -72,11 +72,30 @@ def test_save_snapshot_is_idempotent_and_returns_same_snapshot():
 def test_history_and_latest_still_return_metrics():
     store = InMemoryMetricsStore()
     store.save_snapshot(_metric(views=100))
-    store.save_snapshot(_metric(views=300, date_bucket="2026-11-23"))
+    # Luu y: sau fix_idempotency_hourly_bucket, idempotency_key tinh theo
+    # hour_bucket (tu collected_at), khong phai chi date_bucket. Metric
+    # thu 2 chi khac date_bucket nhung cung collected_at 10:00 se bi dedup
+    # dung luat va get_latest van la 100 — do la loi cua fixture test nay
+    # (1 failed o CI truoc), khong phai loi cua save_snapshot(). De co
+    # snapshot thu 2 that su, phai doi ca collected_at sang gio khac.
+    store.save_snapshot(_metric(
+        views=300, date_bucket="2026-11-23",
+        collected_at=datetime(2026, 11, 23, 10, 0, tzinfo=timezone.utc),
+    ))
     assert store.get_latest(video_id="vid-1").views == 300
     assert store.get_latest(video_id="missing") is None
     rollup = store.daily_rollup(video_id="vid-1", date_bucket="2026-11-22")
     assert rollup is not None and rollup.views == 100
+
+
+def test_same_hour_bucket_is_deduped_even_if_date_differs():
+    """Hoi quy cho idempotency theo gio: cung hour_bucket thi dedup,
+    du date_bucket co khac (chung minh test tren khong phai sua code)."""
+    store = InMemoryMetricsStore()
+    first = store.save_snapshot(_metric(views=100))
+    second = store.save_snapshot(_metric(views=300, date_bucket="2026-11-23"))
+    assert second is first
+    assert store.get_latest(video_id="vid-1").views == 100
 
 
 def test_invalid_metric_still_rejected_before_snapshot():

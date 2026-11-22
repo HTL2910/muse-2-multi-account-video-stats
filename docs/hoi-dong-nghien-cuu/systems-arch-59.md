@@ -1,6 +1,6 @@
 # Sửa lỗi `fix/fix_core_store_return_type`: Core InMemoryMetricsStore.save_snapshot trả VideoStatsSnapshot theo protocol
 
-_systems-arch · Chuyên gia Kiến trúc Hệ thống · lần nộp 1_
+_systems-arch · Chuyên gia Kiến trúc Hệ thống · lần nộp 2_
 
 ## Việc được giao
 
@@ -8,9 +8,13 @@ Gộp fix_core_metrics_store_return_type (systems-arch, đã kiểm chứng VM) 
 
 ## Bài làm
 
-Nhánh `fix/fix_core_store_return_type` — chỉ nộp 2 file theo quy tắc nhánh `fix/*`. Thay đổi duy nhất trong `src/core/models.py`: `InMemoryMetricsStore.save_snapshot()` giờ trả `VideoStatsSnapshot(id=new_id(), metric=metric, raw_payload_ref="")` và lưu snapshot đó vào `_by_key`, thay vì trả thẳng `UnifiedVideoMetric`. `get_history()`/`get_latest()`/`daily_rollup()` vẫn trả `UnifiedVideoMetric` như cũ; tính idempotent theo `idempotency_key` không đổi. Phần còn lại giữ nguyên từng dòng của bản trên `main`, kể cả khối import try/except (thuộc phạm vi `fix_import_dual_contracts`, không sửa ở nhánh này).
+Nhánh `fix/fix_core_store_return_type` — sửa lại sau lần CI fail, chỉ nộp 2 file theo quy tắc nhánh `fix/*`.
 
-Kiểm thử đã chạy trên VM Linux (Python 3.12.3, pytest 9.2.0): `pytest tests/test_fix_core_store_return_type.py -v` = **5 passed**. Vì `src/contracts.py` thật trên `main` không có trên VM này, bản kiểm thử dùng stub contracts trung thực tại chỗ (chỉ để kiểm thử, không nộp) với đúng `VideoStatsSnapshot(id, metric, raw_payload_ref)` và `UnifiedVideoMetric` theo phương án hội đồng đã thống nhất; kết quả thật trên `main` do CI báo cáo.
+Nguyên nhân 1 failed: **lỗi ở fixture test, không phải ở code fix**. Sau `fix_idempotency_hourly_bucket` đã merge, `UnifiedVideoMetric.idempotency_key` tính theo `hour_bucket` (từ `collected_at`), không phải chỉ `date_bucket` — bằng chứng trong log CI: cả hai metric đều có `hour_bucket='2026-11-22T10:00'`. Metric thứ hai của tôi chỉ đổi `date_bucket` sang 2026-11-23 nhưng giữ nguyên `collected_at` 10:00 nên bị dedup đúng luật, `get_latest()` vẫn là 100. Stub contracts trên VM của tôi trước đây tính idempotency theo ngày nên không bắt được lỗi — đã sửa stub cho khớp logic theo giờ rồi chạy lại.
+
+Sửa test: metric thứ hai đổi cả `collected_at` sang 2026-11-23 10:00 để có snapshot thật sự khác giờ, và thêm test hồi quy `test_same_hour_bucket_is_deduped_even_if_date_differs` chứng minh cùng giờ thì dedup dù khác ngày. Code `src/core/models.py` không đổi so với bản đã nộp trước (vẫn trả `VideoStatsSnapshot`).
+
+Kiểm thử trên VM Linux (Python 3.12.3, pytest 9.2.0), với stub idempotency đã khớp bản thật theo giờ: `pytest tests/test_fix_core_store_return_type.py` = **6 passed** (5 cũ + 1 hồi quy mới).
 
 (đã nộp file `src/core/models.py`)
 
