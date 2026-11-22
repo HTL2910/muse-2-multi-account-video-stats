@@ -38,6 +38,7 @@ try:  # repo root tren sys.path
         TokenSet,
         UnifiedVideoMetric,
         Video,
+        VideoStatsSnapshot,
         VideoStatus,
         is_fail_closed_status,
         utcnow,
@@ -62,6 +63,7 @@ except ImportError:  # goi nhu package src.core.*
         TokenSet,
         UnifiedVideoMetric,
         Video,
+        VideoStatsSnapshot,
         VideoStatus,
         is_fail_closed_status,
         utcnow,
@@ -297,23 +299,30 @@ class InMemoryVideoStore:
 
 
 class InMemoryMetricsStore:
-    """MetricsStore protocol: snapshot append-only, idempotent theo idempotency_key."""
+    """MetricsStore protocol: snapshot append-only, idempotent theo idempotency_key.
+
+    Fix (fix_core_store_return_type): save_snapshot() phai tra
+    VideoStatsSnapshot nhu contracts.MetricsStore khai bao, khong tra
+    thang UnifiedVideoMetric — neu khong, code goi qua protocol va
+    truy cap .metric se AttributeError va cac store khong the thay
+    the nhau (ingestion/analytics tra dung kieu, core thi khong).
+    """
 
     def __init__(self) -> None:
-        self._by_key: dict[str, UnifiedVideoMetric] = {}
+        self._by_key: dict[str, VideoStatsSnapshot] = {}
         self._history: dict[str, list[UnifiedVideoMetric]] = {}
 
-    def save_snapshot(self, metric: UnifiedVideoMetric):
+    def save_snapshot(self, metric: UnifiedVideoMetric) -> VideoStatsSnapshot:
         errors = validate_metric(metric)
         if errors:
             raise ValueError(f"invalid metric: {errors}")
         key = metric.idempotency_key
         if key in self._by_key:
             return self._by_key[key]  # idempotent: khong ghi de, khong tao trung
-        self._by_key[key] = metric
+        snapshot = VideoStatsSnapshot(id=new_id(), metric=metric, raw_payload_ref="")
+        self._by_key[key] = snapshot
         self._history.setdefault(metric.video_id, []).append(metric)
-        # Tra ve object tuong duong VideoStatsSnapshot (khong import vong tron)
-        return metric
+        return snapshot
 
     def get_history(self, *, video_id: str, start: datetime, end: datetime) -> list[UnifiedVideoMetric]:
         return [m for m in self._history.get(video_id, []) if start <= m.collected_at <= end]
