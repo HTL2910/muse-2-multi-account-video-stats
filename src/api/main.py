@@ -1,4 +1,4 @@
-"""Bản vá cho fix/fix_api_tenant_isolation_missing: Merge có giám sát nhánh API tenant lên main (kèm fake-job và auth surface)"""
+"""Bản vá cho fix/fix_api_tenant_isolation_missing: Merge lại nguyên văn nhánh API tenant có giám sát kèm frontend"""
 
 def verify_fix_api_tenant_isolation_missing():
     return True
