@@ -14,6 +14,34 @@ Quy uoc:
   REJECTED, khong dung proxy/session mac dinh cua account khac.
 
 Python 3.11+, chi dung thu vien chuan (dataclasses, enum, typing).
+
+Changelog 1.1.0 (fix_idempotency_hourly_bucket, Team Lead khoa):
+- Tach idempotency cua snapshot khoi idempotency cua rollup ngay.
+  ``UnifiedVideoMetric.snapshot_key`` = hash(account, platform_video,
+  bucket GIO) dung cho time-series; ``daily_key`` = hash(account,
+  platform_video, ngay YYYY-MM-DD) CHI dung cho rollup ngay.
+  ``idempotency_key`` cua metric tu 1.1.0 tro di CHINH LA snapshot_key
+  (theo gio), khong con la khoa ngay nua — day la thay doi co chu y,
+  de cac MetricsStore hien co (core / ingestion / time_series) dedup
+  theo ``.idempotency_key`` tu dong tro thanh theo gio ma khong can
+  sua code cua ho. Store nao tu build key bang
+  ``build_idempotency_key`` (khoa ngay) phai chuyen sang
+  ``build_snapshot_idempotency_key`` cho snapshot, giu
+  ``build_daily_idempotency_key`` chi cho rollup.
+- ``CollectJob`` tu sinh idempotency_key tu
+  ``job_type:account:video:bucket-phut-cua-scheduled_at`` (UTC,
+  ``YYYY-MM-DDTHH:MM``). Hai job cung video khac thoi diem lap lich
+  khong con trung key; job lap lai dung cung phut lap lich moi bi dedup.
+  Them 2 truong co default ``deduplicated`` / ``duplicate_of`` de
+  scheduler tra ve job goc kem co dedup thay vi PENDING gia.
+- TIMESCALE_DDL (o time_series, PR tiep theo) phai doi UNIQUE
+  (idempotency_key) thanh UNIQUE (time, snapshot_key) vi hypertable
+  bat buoc unique index chua cot phan vung ``time``.
+- Gioi han co chu y cua bucket gio: 2 snapshot cung gio (vd 10:00 va
+  10:15) van dedup thanh 1 diem/gio — do la muc dich cua bucket gio
+  (bao ve quota, 1 diem/gio cho velocity_1h). Muon chi tiet 15 phut
+  thi phai doi SNAPSHOT_BUCKET_HOURS / bucket xuong 15 phut o mot
+  phien ban contract moi, khong tu y doi o store.
 """
 
 from __future__ import annotations
@@ -32,6 +60,7 @@ __all__ = [
     "RISK_STOP_THRESHOLD",
     "TOKEN_REFRESH_BEFORE_MINUTES",
     "PROXY_QUARANTINE_FAILURES",
+    "SNAPSHOT_BUCKET_HOURS",
     "Platform",
     "AccountStatus",
     "AuthMethod",
@@ -84,7 +113,11 @@ __all__ = [
     "FAIL_CLOSED_STATUSES",
     "utcnow",
     "date_bucket",
+    "hour_bucket",
     "build_idempotency_key",
+    "build_snapshot_idempotency_key",
+    "build_daily_idempotency_key",
+    "build_job_idempotency_key",
     "compute_engagement_rate",
     "compute_growth_rate",
     "validate_metric",
@@ -92,7 +125,7 @@ __all__ = [
     "is_terminal_job_status",
 ]
 
-CONTRACTS_VERSION = "1.0.0"
+CONTRACTS_VERSION = "1.1.0"
 
 # --- Hang so van hanh dung chung -------------------------------------------
 MAX_JOB_RETRIES = 3
@@ -100,6 +133,8 @@ RISK_REDUCE_THRESHOLD = 0.7
 RISK_STOP_THRESHOLD = 0.9
 TOKEN_REFRESH_BEFORE_MINUTES = 30
 PROXY_QUARANTINE_FAILURES = 3
+# Do rong cua bucket snapshot: 1 gio. Chi Team Lead moi duoc doi.
+SNAPSHOT_BUCKET_HOURS = 1
 
 
 # ==========================================================================
@@ -513,7 +548,11 @@ class UnifiedVideoMetric:
     Don vi: views/likes/comments/shares/saves la so luong; watch_time la
     giay; followers_delta la chenh lech follower so voi snapshot truoc.
     ``collected_at`` la thoi diem thu thap (UTC), ``date_bucket`` la ngay
-    YYYY-MM-DD dung lam khoa idempotency.
+    YYYY-MM-DD dung cho rollup ngay, ``hour_bucket`` la gio
+    YYYY-MM-DDTHH:00 dung lam khoa idempotency cua snapshot.
+
+    Tu 1.1.0: ``idempotency_key`` == ``snapshot_key`` (theo gio).
+    ``daily_key`` chi dung cho rollup ngay, khong dung de dedup snapshot.
     """
 
     video_id: str  # UUID noi bo (Video.id)
@@ -533,18 +572,38 @@ class UnifiedVideoMetric:
     source: MetricSource = MetricSource.PUBLIC_WEB
     quality: DataQuality = DataQuality.OK
     date_bucket: str = ""  # YYYY-MM-DD; neu rong thi lay tu collected_at
+    hour_bucket: str = ""  # YYYY-MM-DDTHH:00 UTC; neu rong thi lay tu collected_at
 
     def __post_init__(self) -> None:
         if not self.date_bucket:
             object.__setattr__(
                 self, "date_bucket", self.collected_at.date().isoformat()
             )
+        if not self.hour_bucket:
+            # Dung collected_at goc (khong dung date_bucket da cat) de
+            # tranh lech mui gio khi collected_at co timezone khac UTC.
+            object.__setattr__(self, "hour_bucket", hour_bucket(self.collected_at))
+
+    @property
+    def snapshot_key(self) -> str:
+        """Khoa idempotency cua snapshot time-series (theo gio)."""
+        return build_snapshot_idempotency_key(
+            self.account_id, self.platform_video_id, self.hour_bucket
+        )
+
+    @property
+    def daily_key(self) -> str:
+        """Khoa idempotency cua rollup ngay (chi dung cho rollup)."""
+        return build_daily_idempotency_key(
+            self.account_id, self.platform_video_id, self.date_bucket
+        )
 
     @property
     def idempotency_key(self) -> str:
-        return build_idempotency_key(
-            self.account_id, self.platform_video_id, self.date_bucket
-        )
+        # 1.1.0: co chu y doi tu khoa ngay sang khoa gio. Cac store
+        # dedup theo .idempotency_key se tu dong luu duoc nhieu
+        # snapshot trong cung 1 ngay, khac gio.
+        return self.snapshot_key
 
     @property
     def engagement_rate(self) -> float:
@@ -570,7 +629,13 @@ class VideoStatsSnapshot:
 
 @dataclass
 class CollectJob:
-    """Mot job thu thap trong hang doi uu tien."""
+    """Mot job thu thap trong hang doi uu tien.
+
+    Tu 1.1.0, idempotency_key tu sinh gom ca bucket phut cua
+    ``scheduled_at`` (UTC). ``deduplicated`` / ``duplicate_of`` la
+    co tra ve cua scheduler khi job bi dedup: scheduler phai tra job
+    goc kem ``deduplicated=True`` thay vi tao job PENDING gia.
+    """
 
     id: str
     job_type: JobType
@@ -586,11 +651,14 @@ class CollectJob:
     lease_until: Optional[datetime] = None
     payload: dict[str, Any] = field(default_factory=dict)
     last_error: str = ""
+    deduplicated: bool = False
+    duplicate_of: Optional[str] = None  # id cua job goc khi bi dedup
 
     def __post_init__(self) -> None:
         if not self.idempotency_key:
-            seed = f"{self.job_type.value}:{self.account_id}:{self.video_id or ''}"
-            self.idempotency_key = hashlib.sha256(seed.encode()).hexdigest()[:32]
+            self.idempotency_key = build_job_idempotency_key(
+                self.job_type, self.account_id, self.video_id, self.scheduled_at
+            )
 
     @property
     def can_retry(self) -> bool:
@@ -849,10 +917,15 @@ class ProxyPool(Protocol):
 
 
 class MetricsStore(Protocol):
-    """Kho luu snapshot metrics (PostgreSQL + TimescaleDB/ClickHouse)."""
+    """Kho luu snapshot metrics (PostgreSQL + TimescaleDB/ClickHouse).
+
+    Tu 1.1.0: ``save_snapshot`` idempotent theo ``snapshot_key``
+    (bucket gio) cua metric, khong theo ngay nua. Rollup ngay dedup
+    rieng theo ``daily_key``.
+    """
 
     def save_snapshot(self, metric: UnifiedVideoMetric) -> VideoStatsSnapshot:
-        """Luu snapshot append-only, idempotent theo idempotency_key."""
+        """Luu snapshot append-only, idempotent theo snapshot_key (theo gio)."""
         ...
 
     def get_history(
@@ -871,7 +944,12 @@ class MetricsStore(Protocol):
 
 
 class TaskScheduler(Protocol):
-    """Scheduler / hang doi tac vu phan tan."""
+    """Scheduler / hang doi tac vu phan tan.
+
+    Tu 1.1.0: ``enqueue`` khi gap job trung idempotency_key phai tra
+    ve job goc kem ``deduplicated=True`` / ``duplicate_of=<id goc>``,
+    khong tra job moi o trang thai PENDING.
+    """
 
     def enqueue(self, job: CollectJob) -> CollectJob:
         """Dua job vao hang doi uu tien, tra ve job da co id/status."""
@@ -930,26 +1008,118 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _as_utc(moment: datetime) -> datetime:
+    """Chuyen datetime ve UTC; datetime naive duoc coi la UTC."""
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
 def date_bucket(moment: datetime) -> str:
     """Ngay YYYY-MM-DD (UTC) dung lam khoa idempotency theo ngay."""
-    return moment.astimezone(timezone.utc).date().isoformat()
+    return _as_utc(moment).date().isoformat()
+
+
+def hour_bucket(moment: datetime) -> str:
+    """Gio YYYY-MM-DDTHH:00 (UTC) dung lam bucket snapshot.
+
+    Cat phut/giay/microsecond. Vi du: 2026-11-22 10:37 UTC
+    -> ``"2026-11-22T10:00"``. Datetime co timezone khac duoc
+    chuyen ve UTC truoc khi cat (17:20 +07:00 -> 10:00 UTC).
+    """
+    utc = _as_utc(moment)
+    return utc.strftime("%Y-%m-%dT%H:00")
+
+
+def _hour_bucket_str(bucket: str | date | datetime) -> str:
+    """Chuan hoa moi dang bucket ve dang YYYY-MM-DDTHH:00."""
+    if isinstance(bucket, datetime):
+        return hour_bucket(bucket)
+    if isinstance(bucket, date):
+        return f"{bucket.isoformat()}T00:00"
+    text = bucket.strip()
+    if len(text) == 10:  # YYYY-MM-DD -> 00:00 cua ngay do
+        return f"{text}T00:00"
+    if "T" in text:
+        # Chap nhan "YYYY-MM-DDTHH", "YYYY-MM-DDTHH:MM",
+        # "YYYY-MM-DDTHH:00", hoac ISO day du co timezone.
+        try:
+            return hour_bucket(datetime.fromisoformat(text))
+        except ValueError:
+            return f"{text[:13]}:00"
+    return text
+
+
+def _date_bucket_str(bucket: str | date | datetime) -> str:
+    """Chuan hoa moi dang bucket ve dang YYYY-MM-DD."""
+    if isinstance(bucket, datetime):
+        return date_bucket(bucket)
+    if isinstance(bucket, date):
+        return bucket.isoformat()
+    text = bucket.strip()
+    if "T" in text:
+        return text[:10]
+    return text
 
 
 def build_idempotency_key(
     account_id: str, platform_video_id: str, bucket: str | date | datetime
 ) -> str:
-    """Khoa idempotency duy nhat cho (account, video, ngay).
+    """Khoa idempotency THEO NGAY cho (account, video, ngay).
 
-    Moi pipeline/store deu phai dung ham nay — khong tu build key rieng.
+    Chi dung cho rollup ngay (tuong duong
+    ``build_daily_idempotency_key``). KHONG dung ham nay de dedup
+    snapshot time-series nua — dung ``build_snapshot_idempotency_key``.
+    Giu nguyen chu ky / ket qua cua 1.0.0 de code cu goi ham nay van
+    cho ra cung mot key ngay.
     """
-    if isinstance(bucket, datetime):
-        bucket_str = date_bucket(bucket)
-    elif isinstance(bucket, date):
-        bucket_str = bucket.isoformat()
-    else:
-        bucket_str = bucket
+    bucket_str = _date_bucket_str(bucket)
     raw = f"{account_id}:{platform_video_id}:{bucket_str}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def build_snapshot_idempotency_key(
+    account_id: str, platform_video_id: str, bucket: str | date | datetime
+) -> str:
+    """Khoa idempotency cua snapshot time-series (theo GIO).
+
+    ``bucket`` co the la datetime (se cat ve gio UTC), date (00:00),
+    hoac chuoi ``YYYY-MM-DDTHH:00`` / ISO datetime. Hai snapshot
+    cung video, cung ngay, khac gio co key khac nhau; cung gio thi
+    cung key (dedup co chu y, 1 diem/gio).
+    """
+    bucket_str = _hour_bucket_str(bucket)
+    raw = f"{account_id}:{platform_video_id}:{bucket_str}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def build_daily_idempotency_key(
+    account_id: str, platform_video_id: str, bucket: str | date | datetime
+) -> str:
+    """Khoa idempotency cua rollup ngay (theo NGAY). Chi dung cho rollup."""
+    bucket_str = _date_bucket_str(bucket)
+    raw = f"{account_id}:{platform_video_id}:{bucket_str}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def build_job_idempotency_key(
+    job_type: JobType | str,
+    account_id: str,
+    video_id: Optional[str],
+    scheduled_at: datetime,
+) -> str:
+    """Khoa idempotency cua CollectJob, gom bucket phut cua scheduled_at.
+
+    Seed: ``job_type:account_id:video_id:YYYY-MM-DDTHH:MM`` (UTC).
+    Dung phut thay vi gio de job FETCH_STATS lap lai 15 phut/lan
+    (10:00, 10:15, 10:30...) khong bi dedup lan nhau, trong khi
+    job lap lai dung cung phut lap lich van bi dedup dung nghia.
+    Tra ve 32 ky tu hex dau cua SHA-256, giong dinh dang cu.
+    """
+    job_value = job_type.value if isinstance(job_type, JobType) else str(job_type)
+    minute_bucket = _as_utc(scheduled_at).strftime("%Y-%m-%dT%H:%M")
+    seed = f"{job_value}:{account_id}:{video_id or ''}:{minute_bucket}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
 
 
 def compute_engagement_rate(
