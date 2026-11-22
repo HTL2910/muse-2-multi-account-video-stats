@@ -34,6 +34,18 @@ token, khong tang proxy); ``try_acquire()`` kiem tra ca 3 lop
 nguyen tu duoi lock, that bai thi khong tru gi ca. Lop per-account
 la token bucket that, moi account 1 bucket rieng theo
 ``per_account_quota_per_day``.
+Fix ``fix_scheduler_scheduled_at_lost`` (khoi phuc fix cu bi mat khi
+merge): truoc day ``PriorityQueue.pop()`` / ``acquire_job()`` lay job
+bat ke ``scheduled_at`` nen job FETCH_STATS hen +6h / +15 phut va job
+retry sau backoff deu bi chay ngay lap tuc. Tu ban nay queue chi tra
+job DA TOI HAN (``scheduled_at <= now``): ``PriorityQueue`` nhan clock
+inject duoc, ``pop_due(now)`` quet TOAN heap tim job due tot nhat theo
+sort key (khong chi peek head — job VIP tuong lai o dau heap khong
+duoc chan job thuong da due phia sau), ``pop()`` bat buoc due,
+``pop_any()`` chi la escape hatch drain/test; ``acquire_job()`` dung
+``pop_due`` voi now snapshot mot lan moi lan goi; ``finish_job()``
+giu nguyen cach tinh ``scheduled_at`` retry (nay moi thuc su duoc
+ton trong). Fix quota / enqueue gate giu nguyen, khong thay doi.
 """
 from __future__ import annotations
 
@@ -45,7 +57,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Optional
 
 try:
@@ -180,13 +192,26 @@ class _Queued:
     job: CollectJob = field(compare=False)
 
 
-class PriorityQueue:
-    """Priority queue theo (priority desc, deadline, FIFO). Dedup theo idempotency_key."""
+def _as_utc(dt: datetime) -> datetime:
+    """Chuan hoa datetime ve UTC; naive duoc coi la UTC."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
-    def __init__(self) -> None:
+
+class PriorityQueue:
+    """Priority queue theo (priority desc, deadline, FIFO). Dedup theo idempotency_key.
+
+    Chi tra job DA TOI HAN (``scheduled_at <= now``) — xem fix
+    ``fix_scheduler_scheduled_at_lost``. ``deadline`` o ``push()``
+    chi la sort key, khac voi ``scheduled_at`` (thoi diem san sang).
+    """
+
+    def __init__(self, *, clock: Callable[[], datetime] = utcnow) -> None:
         self._heap: list[_Queued] = []
         self._seen: dict[str, CollectJob] = {}
         self._seq = 0
+        self._clock = clock
 
     def push(self, job: CollectJob, *, deadline: Optional[datetime] = None) -> bool:
         if job.idempotency_key in self._seen:
@@ -197,12 +222,67 @@ class PriorityQueue:
         self._seen[job.idempotency_key] = job
         return True
 
-    def pop(self) -> Optional[CollectJob]:
+    def pop_due(self, now: Optional[datetime] = None) -> Optional[CollectJob]:
+        """Lay job due tot nhat (uu tien cao nhat, roi deadline som nhat).
+
+        Quet TOAN heap chu khong chi peek head: heap sap theo
+        (priority desc, deadline, FIFO) nen job VIP tuong lai co the
+        nam o dau heap trong khi job thuong da due nam phia sau —
+        chi peek head se chan sai job due do. Job chua due o lai
+        trong queue, khong bi mat.
+        """
+        if not self._heap:
+            return None
+        now = _as_utc(now or self._clock())
+        best_idx: Optional[int] = None
+        for i, item in enumerate(self._heap):
+            if _as_utc(item.job.scheduled_at) <= now:
+                if best_idx is None or item.sort_key < self._heap[best_idx].sort_key:
+                    best_idx = i
+        if best_idx is None:
+            return None
+        job = self._heap.pop(best_idx).job
+        heapq.heapify(self._heap)
+        self._seen.pop(job.idempotency_key, None)
+        return job
+
+    def pop(self, now: Optional[datetime] = None) -> Optional[CollectJob]:
+        """Lay job due tiep theo. Bat buoc due — thay doi co chu y so
+        voi ban cu (pop lay bat ke scheduled_at)."""
+        return self.pop_due(now=now)
+
+    def pop_any(self) -> Optional[CollectJob]:
+        """Escape hatch: lay job bat ke scheduled_at. Chi dung de
+        drain/test — duong chay that KHONG duoc dung ham nay."""
         if not self._heap:
             return None
         item = heapq.heappop(self._heap).job
         self._seen.pop(item.idempotency_key, None)
         return item
+
+    def peek_due(self, now: Optional[datetime] = None) -> Optional[CollectJob]:
+        """Xem job due tot nhat ma khong lay ra (None neu chua co job due)."""
+        if not self._heap:
+            return None
+        now = _as_utc(now or self._clock())
+        best: Optional[CollectJob] = None
+        best_key: Optional[tuple[int, float, int]] = None
+        for item in self._heap:
+            if _as_utc(item.job.scheduled_at) <= now:
+                if best_key is None or item.sort_key < best_key:
+                    best_key = item.sort_key
+                    best = item.job
+        return best
+
+    def peek(self) -> Optional[CollectJob]:
+        """Xem job o dau heap ma khong lay ra (co the chua due)."""
+        return self._heap[0].job if self._heap else None
+
+    def next_scheduled_at(self) -> Optional[datetime]:
+        """Thoi diem job som nhat se toi han (None neu queue rong)."""
+        if not self._heap:
+            return None
+        return min(_as_utc(item.job.scheduled_at) for item in self._heap)
 
     def __len__(self) -> int:
         return len(self._heap)
@@ -346,10 +426,14 @@ class TaskSchedulerImpl:
         self.ring = ConsistentHashRing(self.workers)
         self.quota = quota or QuotaManager()
         self.locks = DistributedLock()
-        self.queues: dict[Platform, PriorityQueue] = {p: PriorityQueue() for p in Platform}
-        self.dead_letter = DeadLetterQueue()
+        # Clock/rng phai dat TRUOC khi tao queue: moi queue dung chung
+        # clock cua scheduler de pop_due() va retry scheduled_at cung
+        # mot moc thoi gian (xem fix_scheduler_scheduled_at_lost).
         self._rng = rng or random.Random()
         self._clock = clock
+        self.queues: dict[Platform, PriorityQueue] = {
+            p: PriorityQueue(clock=clock) for p in Platform}
+        self.dead_letter = DeadLetterQueue()
         # Trang thai account/proxy THAT, do store/caller dang ky hoac dong
         # bo vao (xem register_*/sync_*). Mac dinh RONG = chua biet, va
         # chua biet thi fail-closed o enqueue - KHONG mac dinh ACTIVE.
@@ -504,12 +588,20 @@ class TaskSchedulerImpl:
         Khong goi rieng ``acquire_proxy_slot()`` roi ``allow()`` nua
         (do la goc cua loi off-by-one). Neu try_acquire that bai thi
         chua tru gi ca nen khong can release slot.
+
+        Chi lay job DA TOI HAN (``scheduled_at <= now``) qua
+        ``pop_due()`` — job hen tuong lai o lai trong queue. ``now``
+        duoc snapshot 1 lan moi lan goi de moi job trong vong lap
+        dung cung mot moc thoi gian.
         """
         queue = self.queues[platform]
+        now = self._clock()
         # Thu lan luot (queue nho trong test/dev; production dung peek/pop co dieu kien).
         tried: list[CollectJob] = []
         while len(queue):
-            job = queue.pop()
+            job = queue.pop_due(now=now)
+            if job is None:
+                break
             assert job is not None
             if self.ring.worker_for(job.account_id) != worker_id:
                 tried.append(job)
