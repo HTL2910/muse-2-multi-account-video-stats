@@ -10,6 +10,20 @@ Rules (fail-closed / no guessing):
 - implausible spike vs previous snapshot -> NEEDS_REVIEW, kept out of store
 - dedupe by UnifiedVideoMetric.idempotency_key (account, platform_video, day)
 Stdlib only.
+
+Fix ``fix_ingestion_normalize_removed``:
+- Gia tri khong parse duoc (vd views='abc') khong con bi gan 0 lang le
+  voi quality OK nua: truong do duoc danh dau missing, metric bi
+  PARTIAL (va van giu 0 o truong so de schema khong vo, nhung dashboard
+  phai loai PARTIAL khoi KPI). ``ctr`` dang chuoi ("0.05", "5%") duoc
+  parse that thay vi bi bo qua thanh None.
+- Watch-time: ``watchTimeSeconds`` co uu tien tuyet doi; chi dung
+  ``estimatedMinutesWatched`` (*60) khi khong co gia tri giay hop le.
+  Truoc day phut ghi de giay (120s -> 600s).
+- Phat hien video bi xoa: ``_known`` khong con chi song trong 1 instance
+  nua. ``run()`` nap ``_known`` tu store (platform_video_id da biet cua
+  account) khi bat dau, va store luu append-only nen instance moi cung
+  store van phat hien duoc video da bien mat.
 """
 from __future__ import annotations
 
@@ -51,36 +65,115 @@ _REQUIRED_COUNTERS = ("views", "likes", "comments")
 def _to_int(value: Any) -> Optional[int]:
     if value is None:
         return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        text = value.strip().replace(",", "").replace("_", "")
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                f = float(text)
+            except ValueError:
+                return None
+            return int(f) if f.is_integer() else None
     try:
         return int(value)
     except (TypeError, ValueError):
         return None
 
 
+def _to_float(value: Any) -> Optional[float]:
+    """Parse ctr: so, chuoi so ("0.05"), hoac phan tram ("5%" -> 0.05)."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip().replace(",", "")
+        if not text:
+            return None
+        is_percent = text.endswith("%")
+        if is_percent:
+            text = text[:-1].strip()
+        try:
+            f = float(text)
+        except ValueError:
+            return None
+        return f / 100.0 if is_percent else f
+    return None
+
+
 def normalize_raw_metric(raw: dict[str, Any], *, video: Video,
                          account: PlatformAccount,
                          collected_at: Optional[datetime] = None,
                          source: Optional[MetricSource] = None) -> UnifiedVideoMetric:
-    """Map one raw platform payload onto UnifiedVideoMetric (UTC, seconds)."""
+    """Map one raw platform payload onto UnifiedVideoMetric (UTC, seconds).
+
+    Gia tri co trong raw nhung khong parse duoc duoc ghi vao
+    ``unparseable`` va lam metric PARTIAL — khong bao gio gan 0 lang le
+    voi quality OK. Watch-time: giay (watchTimeSeconds / ms) co uu tien
+    tuyet doi, chi dung phut khi khong co giay hop le.
+    """
     ts = collected_at or utcnow()
     mapping = RAW_FIELD_MAP[account.platform]
     values: dict[str, Any] = {}
+    unparseable: list[str] = []
     missing_required = False
+    watch_seconds: Optional[int] = None
+    watch_minutes: Optional[int] = None
+    watch_ms: Optional[int] = None
     for raw_key, unified in mapping.items():
         if raw_key not in raw:
             continue
         val = _to_int(raw[raw_key])
-        if unified == "_minutes_watched" and val is not None:
-            values["watch_time_seconds"] = val * 60
-        elif unified == "_watch_ms" and val is not None:
-            values["watch_time_seconds"] = val // 1000
-        elif not unified.startswith("_"):
-            values[unified] = val if val is not None else 0
+        if val is None:
+            # Truong co mat nhung gia tri hong (vd 'abc'): khong bia 0.
+            unparseable.append(raw_key)
+            continue
+        if unified == "_minutes_watched":
+            watch_minutes = val
+        elif unified == "_watch_ms":
+            watch_ms = val
+        elif unified == "watch_time_seconds":
+            watch_seconds = val
+        else:
+            values[unified] = val
+    # Uu tien tuyet doi: giay > ms > phut. Phut chi la fallback khi
+    # khong co giay hop le (truoc day phut ghi de giay).
+    if watch_seconds is not None:
+        values["watch_time_seconds"] = watch_seconds
+    elif watch_ms is not None:
+        values["watch_time_seconds"] = watch_ms // 1000
+    elif watch_minutes is not None:
+        values["watch_time_seconds"] = watch_minutes * 60
     for name in _REQUIRED_COUNTERS:
         if name not in values:
             missing_required = True
             values.setdefault(name, 0)
-    quality = DataQuality.PARTIAL if missing_required else DataQuality.OK
+    # followers_delta / impressions: hong thi PARTIAL, khong bia 0 lang le.
+    followers_raw = raw.get("followers_delta")
+    followers_delta = _to_int(followers_raw)
+    if followers_raw is not None and followers_delta is None:
+        unparseable.append("followers_delta")
+        followers_delta = 0
+    impressions_raw = raw.get("impressions", raw.get("impression_count"))
+    impressions = _to_int(impressions_raw)
+    if impressions_raw is not None and impressions is None:
+        unparseable.append("impressions")
+    ctr: Optional[float] = None
+    if "ctr" in raw:
+        ctr = _to_float(raw.get("ctr"))
+        if ctr is None:
+            unparseable.append("ctr")
+    quality = (DataQuality.PARTIAL if (missing_required or unparseable)
+               else DataQuality.OK)
     return UnifiedVideoMetric(
         video_id=video.id, account_id=account.id, platform=account.platform,
         platform_video_id=video.platform_video_id,
@@ -88,9 +181,9 @@ def normalize_raw_metric(raw: dict[str, Any], *, video: Video,
         comments=values.get("comments", 0), shares=values.get("shares", 0),
         saves=values.get("saves", 0),
         watch_time_seconds=values.get("watch_time_seconds", 0),
-        followers_delta=_to_int(raw.get("followers_delta")) or 0,
-        impressions=_to_int(raw.get("impressions", raw.get("impression_count"))),
-        ctr=(float(raw["ctr"]) if isinstance(raw.get("ctr"), (int, float)) else None),
+        followers_delta=followers_delta or 0,
+        impressions=impressions,
+        ctr=ctr,
         collected_at=ts, source=source or _SOURCE[account.platform],
         quality=quality, date_bucket=date_bucket(ts))
 
@@ -118,6 +211,23 @@ class InMemoryMetricsStore:
     def get_latest(self, *, video_id: str) -> Optional[UnifiedVideoMetric]:
         rows = self._by_video.get(video_id, [])
         return max(rows, key=lambda m: m.collected_at) if rows else None
+
+    def known_platform_video_ids(self, account_id: str) -> set[str]:
+        """Tat ca platform_video_id da co snapshot cua account nay.
+
+        Day la nguon su that de phat hien video bi xoa: pipeline moi
+        instance nao cung nap _known tu day, khong phu thuoc bo nho
+        cua instance cu.
+        """
+        known: set[str] = set()
+        for rows in self._by_video.values():
+            for m in rows:
+                if m.account_id == account_id and m.platform_video_id:
+                    known.add(m.platform_video_id)
+        return known
+
+    # Alias ngan gon hon cho cung mot nguon su that.
+    known_video_ids = known_platform_video_ids
 
     def __len__(self) -> int:
         return len(self._by_key)
@@ -160,6 +270,27 @@ class IngestionPipeline:
         self._spike_ratio, self._spike_floor = spike_ratio, spike_floor
         self._known: set[str] = set(known_video_ids or [])
 
+    @property
+    def known_video_ids(self) -> set[str]:
+        """Ban sao tap platform_video_id da biet (tu store + seed)."""
+        return set(self._known)
+
+    def _load_known_from_store(self, account: PlatformAccount) -> set[str]:
+        """Nap _known tu store/DB (duck-typing de store PG cung dung duoc).
+
+        Thu lan luot cac ten method store co the co; store khong ho tro
+        thi tra tap rong va pipeline dung _known trong bo nho.
+        """
+        for name in ("known_platform_video_ids", "known_video_ids",
+                     "list_platform_video_ids"):
+            method = getattr(self._store, name, None)
+            if callable(method):
+                try:
+                    return set(method(account.id))
+                except TypeError:
+                    continue
+        return set()
+
     def _classify(self, metric: UnifiedVideoMetric) -> DataQuality:
         if validate_metric(metric):
             return DataQuality.NEEDS_REVIEW
@@ -175,6 +306,9 @@ class IngestionPipeline:
     def run(self, account: PlatformAccount, *, job_id: str = "",
             limit: int = 50) -> PipelineReport:
         report = PipelineReport(account_id=account.id)
+        # 0) Nap _known tu store truoc khi so sanh: instance moi cung
+        #    store van biet video nao da tung co (de phat hien video xoa).
+        self._known = set(self._known) | self._load_known_from_store(account)
         # 1) Discover
         videos = self._adapter.list_videos(account, limit=limit)
         report.videos_found = len(videos)
