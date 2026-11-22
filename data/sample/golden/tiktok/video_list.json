@@ -1,0 +1,18 @@
+{
+  "data": {
+    "videos": [
+      {
+        "id": "tt_video_001",
+        "title": "Sample TikTok",
+        "create_time": 1767225600,
+        "duration": 35,
+        "view_count": 50000,
+        "like_count": 4200,
+        "comment_count": 310,
+        "share_count": 190,
+        "collect_count": 260
+      }
+    ],
+    "has_more": false
+  }
+}

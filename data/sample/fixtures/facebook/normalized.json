@@ -1,0 +1,15 @@
+[
+  {
+    "platform": "facebook",
+    "platform_video_id": "fb_video_001",
+    "title": "Sample FB Video",
+    "views": 12000,
+    "likes": 800,
+    "comments": 120,
+    "shares": 45,
+    "saves": 0,
+    "watch_time_seconds": 45,
+    "source": "facebook_graph_api",
+    "quality": "ok"
+  }
+]

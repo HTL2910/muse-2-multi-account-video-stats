@@ -1,0 +1,62 @@
+[
+  {
+    "id": "golden-facebook-001",
+    "platform": "facebook",
+    "name": "facebook video list basic",
+    "raw_fixture_path": "data/golden/facebook/video_list.json",
+    "expected_video_count": 1,
+    "expected_first_metric": {
+      "platform": "facebook",
+      "platform_video_id": "fb_video_001",
+      "title": "Sample FB Video",
+      "views": 12000,
+      "likes": 800,
+      "comments": 120,
+      "shares": 45,
+      "saves": 0,
+      "watch_time_seconds": 45,
+      "source": "facebook_graph_api",
+      "quality": "ok"
+    }
+  },
+  {
+    "id": "golden-tiktok-001",
+    "platform": "tiktok",
+    "name": "tiktok video list basic",
+    "raw_fixture_path": "data/golden/tiktok/video_list.json",
+    "expected_video_count": 1,
+    "expected_first_metric": {
+      "platform": "tiktok",
+      "platform_video_id": "tt_video_001",
+      "title": "Sample TikTok",
+      "views": 50000,
+      "likes": 4200,
+      "comments": 310,
+      "shares": 190,
+      "saves": 260,
+      "watch_time_seconds": 0,
+      "source": "tiktok_api",
+      "quality": "ok"
+    }
+  },
+  {
+    "id": "golden-youtube-001",
+    "platform": "youtube",
+    "name": "youtube video list basic",
+    "raw_fixture_path": "data/golden/youtube/video_list.json",
+    "expected_video_count": 1,
+    "expected_first_metric": {
+      "platform": "youtube",
+      "platform_video_id": "yt_video_001",
+      "title": "Sample YT Video",
+      "views": 98000,
+      "likes": 6100,
+      "comments": 540,
+      "shares": 0,
+      "saves": 0,
+      "watch_time_seconds": 0,
+      "source": "youtube_data_api",
+      "quality": "ok"
+    }
+  }
+]
