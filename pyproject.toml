@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multi-account-video-stats"
+version = "0.1.0"
+description = "Multi-account management system for Facebook, TikTok and YouTube video statistics, with proxy support."
+readme = "README.md"
+requires-python = ">=3.11"
+# Production dependencies. Every entry is pinned exactly (==) so a fresh
+# checkout, CI or Docker build reproduces the same environment.
+# cryptography is a PRODUCTION dependency on purpose: src/accounts/vault.py
+# must use real AES-256-GCM. It must never silently fall back to the stdlib
+# HMAC-stream implementation because cryptography happened to be missing.
+dependencies = [
+    "fastapi==0.165.0",
+    "pydantic==2.14.4",
+    "cryptography==50.0.2",
+    "httpx==0.28.1",
+    "uvicorn==0.54.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"

@@ -9,7 +9,6 @@
 
 ---
 
-[[FILE README.md]]
 # multi-account-video-stats
 
 Hệ thống quản lý nhiều tài khoản Facebook, TikTok và YouTube để xem thông số video, có dùng proxy — Modular Monolith tiến hóa sang Microservices, Official API trước, fail-closed theo thiết kế.
@@ -495,4 +494,3 @@ Khi 3 điểm trên được xác nhận xanh, README này là tài liệu đón
 ---
 
 *Báo cáo tổng kết do Trưởng nhóm Điều phối Nghiên cứu (muse, CEO) biên soạn thay mặt Hội đồng Chuyên gia AI MuseAssistantTeam — systems-arch, algo-ml, backend-sec, fullstack-ux — ngày 22/11/2026.*
-[[/FILE]]
