@@ -18,14 +18,14 @@
 # - ToS: official APIs first (connectors), no automated like/comment/follow
 #   actions exist in any service; rate limits are enforced by the scheduler.
 #
-# COMPANION FILES — BAT BUOC PHAI CO O BUOC MERGE (khong thuoc nhanh nay,
-# chi duoc nop docker-compose.yml + test cua no):
+# COMPANION FILES — da giao cung fix_docker_compose_companions (nhanh
+# fix/fix_docker_compose_companions), khong con la dieu kien treo:
 # - docker/Dockerfile.api      multi-stage, non-root, chi copy src can
 #   thiet; CMD: uvicorn src.api.main:app --host 0.0.0.0 --port 8000.
 # - docker/Dockerfile.worker   multi-stage, non-root; CMD chay vong lap
-#   worker (lay job tu scheduler, goi pipeline) — khong de trong.
+#   worker that: `python -m src.worker` (src/worker/__main__.py).
 # - docker/Dockerfile.frontend multi-stage: build src/web (Next.js) roi
-#   chay bang non-root user; chi copy src/web + package.json/lockfile.
+#   chay bang non-root user; chi copy src/web + package.json.
 # - src/scheduler/__main__.py  entrypoint that cua scheduler: argparse
 #   --beat, vong lap tick (mac dinh 60s, env SCHEDULER_INTERVAL_SECONDS)
 #   goi schedule_jobs_for_account() + enqueue(), xu ly SIGTERM graceful
@@ -34,10 +34,11 @@
 #   vi task_scheduler.py khong co khoi __main__.
 # - scripts/init_secrets.sh    tao ../.secrets/postgres_password.txt,
 #   vault_master_key.txt, vault_backup_passphrase.txt (gia tri ngau nhien,
-#   chmod 600); khong commit file ket qua.
-# - .gitignore                 them `.secrets/` va `.env`.
-# Khi cac file tren chua co, `docker compose config`/`build`/`up` van
-# that bai — do la loi thieu file di kem, khong phai loi cua compose nay.
+#   chmod 600, chay lai khong xoay secret da co); khong commit file ket qua.
+# - .gitignore                 da co `.secrets/` va `.env`.
+# Thieu bat ky file nao o tren thi `docker compose config`/`build`/`up`
+# se that bai — tests/test_fix_docker_compose_companions.py khoa su ton
+# tai + tinh nhat quan cua chung voi compose nay.
 #
 # Fix (fix_docker_compose_unrunnable):
 # - api healthcheck probe dung endpoint /health that cua FastAPI.
@@ -106,8 +107,9 @@ services:
   worker:
     <<: *common
     build: { context: .., dockerfile: docker/Dockerfile.worker }
-    # Khong co command o day: Dockerfile.worker PHAI dinh nghia CMD chay
-    # vong lap worker (xem COMPANION FILES). De trong CMD la loi khoi dong.
+    # Khong co command o day: Dockerfile.worker dinh nghia CMD that
+    # `python -m src.worker` (src/worker/__main__.py). De trong CMD
+    # la loi khoi dong.
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-stats}@postgres:5432/${POSTGRES_DB:-stats}
       REDIS_URL: redis://redis:6379/0

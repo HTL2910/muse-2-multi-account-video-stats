@@ -6,3 +6,8 @@ __pycache__/
 venv/
 node_modules/
 .DS_Store
+
+# Local secrets — created by scripts/init_secrets.sh, referenced by
+# docker/docker-compose.yml as ../.secrets/*.txt. NEVER commit these.
+.secrets/
+.env
