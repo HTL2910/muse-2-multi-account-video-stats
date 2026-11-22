@@ -11,11 +11,37 @@ PlatformAccount, AccountStatus, UnifiedVideoMetric, AlertNotifier.
 - Notifier: notification center (luu trong store) + Telegram/Webhook/
   Discord qua sender tiem vao (mac dinh urllib, test tiem fake).
   Loi gui 1 kenh khong lam chet cac kenh khac.
+
+Fix ``fix_alert_group_workspace_telegram`` (gop
+fix_alert_group_workspace_and_telegram_p):
+- assign_bulk/remove_bulk: truoc day chi nhan group_id + account_ids,
+  khong doi chieu workspace nen workspace A gan duoc account cua
+  workspace B vao group cua minh (lo hong cach ly tenant). Nay ca
+  hai ham nhan them ``workspace_id`` (workspace cua caller) va
+  ``accounts`` (registry de tra workspace cua tung account); moi
+  account khong cung workspace voi group — hoac khong tra duoc trong
+  registry da cung cap — deu bi TU CHOI fail-closed bang
+  WorkspaceMismatchError, kiem tra truoc khi mutate nen khong co gan
+  mot phan, va moi lan gan/go (thanh cong hay bi tu choi) deu ghi
+  vao audit_log append-only cua store.
+- WebhookNotifier kind="telegram": truoc day gui payload chi co
+  {"text": ...} trong khi Telegram Bot API sendMessage BAT BUOC
+  chat_id + text -> luon bi 400. Nay notifier nhan ``chat_id``
+  rieng trong cau hinh (du phong: tham so chat_id tren URL) va gui
+  {"chat_id": ..., "text": ...}; thieu chat_id thi raise ngay thay
+  vi gui payload chac chan loi.
+- MultiChannelNotifier: truoc day loi gui kenh chi bi nuot vao list
+  ``errors`` khong ai doc. Nay moi loi deu duoc dem vao ``metrics``
+  (sent/failed tong va theo tung kenh), ghi log canh bao co cau
+  truc, va goi ``metrics_sink`` tiem vao neu co (noi observability
+  dem canh bao that bai) — list errors van giu de tuong thich.
 """
 from __future__ import annotations
 
 import json
+import logging
 import threading
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -34,9 +60,16 @@ except ImportError:  # pragma: no cover
     )
 
 __all__ = ["GroupTagStore", "AlertRuleConfig", "AlertRuleEngine",
-           "NotificationCenter", "WebhookNotifier", "MultiChannelNotifier"]
+           "NotificationCenter", "WebhookNotifier", "MultiChannelNotifier",
+           "WorkspaceMismatchError"]
 
 Sender = Callable[[str, dict], None]  # (url, payload) -> None
+
+_log = logging.getLogger("api.alert_rule_engine")
+
+
+class WorkspaceMismatchError(PermissionError):
+    """Gan/go account khac workspace vao group - fail-closed."""
 
 
 def _http_sender(url: str, payload: dict) -> None:
@@ -52,6 +85,10 @@ class GroupTagStore:
     def __init__(self) -> None:
         self._groups: dict[str, AccountGroup] = {}
         self._lock = threading.Lock()
+        # Append-only audit cho assign/remove: ca thanh cong lan bi
+        # tu choi deu ghi lai (ai gan account nao vao group nao, o
+        # workspace nao, ket qua gi).
+        self.audit_log: list[dict] = []
 
     def create_group(self, *, workspace_id: str, name: str,
                      tags: list[str] | None = None) -> AccountGroup:
@@ -66,19 +103,96 @@ class GroupTagStore:
     def get(self, group_id: str) -> Optional[AccountGroup]:
         return self._groups.get(group_id)
 
-    def assign_bulk(self, *, group_id: str, account_ids: list[str]) -> AccountGroup:
+    # -- kiem tra workspace (fail-closed) ------------------------------
+    @staticmethod
+    def _workspace_index(accounts) -> Optional[dict[str, str]]:
+        """Chuan hoa ``accounts`` (list PlatformAccount hoac dict
+        id -> PlatformAccount/workspace_id) thanh id -> workspace_id.
+        None neu caller khong cung cap registry."""
+        if accounts is None:
+            return None
+        index: dict[str, str] = {}
+        if isinstance(accounts, dict):
+            items = accounts.items()
+            for aid, value in items:
+                index[aid] = value if isinstance(value, str) \
+                    else str(getattr(value, "workspace_id", ""))
+            return index
+        for a in accounts:
+            index[a.id] = a.workspace_id
+        return index
+
+    def _check_workspace(self, action: str, g: AccountGroup,
+                         account_ids: list[str],
+                         workspace_id: Optional[str], accounts) -> None:
+        """Nem WorkspaceMismatchError (+ audit) neu bat ky kiem tra
+        workspace nao fail. Chay TRUOC khi mutate nen thao tac hoac
+        thanh cong toan bo, hoac khong doi gi ca."""
+        reason = ""
+        if workspace_id is not None and workspace_id != g.workspace_id:
+            reason = (f"caller workspace {workspace_id} != group "
+                      f"workspace {g.workspace_id}")
+        index = self._workspace_index(accounts)
+        if not reason and index is not None:
+            for aid in account_ids:
+                ws = index.get(aid)
+                if ws is None:
+                    reason = f"account {aid} not in provided registry"
+                    break
+                if ws != g.workspace_id:
+                    reason = (f"account {aid} belongs to workspace {ws}, "
+                              f"group is in {g.workspace_id}")
+                    break
+        if reason:
+            self._audit(action, g, workspace_id, account_ids,
+                        result="rejected", reason=reason)
+            _log.warning(json.dumps(
+                {"level": "warning", "component": "alerts",
+                 "event": "group_workspace_mismatch", "action": action,
+                 "group_id": g.id, "reason": reason}, sort_keys=True))
+            raise WorkspaceMismatchError(reason)
+
+    def _audit(self, action: str, g: AccountGroup,
+               workspace_id: Optional[str], account_ids: list[str],
+               *, result: str, reason: str = "") -> None:
+        self.audit_log.append({
+            "action": action, "group_id": g.id,
+            "group_workspace_id": g.workspace_id,
+            "caller_workspace_id": workspace_id,
+            "account_ids": list(account_ids), "result": result,
+            "reason": reason, "at": utcnow().isoformat()})
+
+    def assign_bulk(self, *, group_id: str, account_ids: list[str],
+                    workspace_id: Optional[str] = None,
+                    accounts=None) -> AccountGroup:
+        """Gan account vao group, CHI khi moi account cung workspace
+        voi group. ``workspace_id`` la workspace cua caller;
+        ``accounts`` la registry (list PlatformAccount hoac dict) de
+        doi chieu workspace cua tung account. Lech workspace ->
+        WorkspaceMismatchError, khong gan mot phan."""
         with self._lock:
             g = self._groups[group_id]
+            self._check_workspace("assign", g, account_ids,
+                                  workspace_id, accounts)
             for aid in account_ids:
                 if aid not in g.account_ids:
                     g.account_ids.append(aid)
+            self._audit("assign", g, workspace_id, account_ids, result="ok")
             return g
 
-    def remove_bulk(self, *, group_id: str, account_ids: list[str]) -> AccountGroup:
+    def remove_bulk(self, *, group_id: str, account_ids: list[str],
+                    workspace_id: Optional[str] = None,
+                    accounts=None) -> AccountGroup:
+        """Go account khoi group voi cung kiem tra workspace nhu
+        assign_bulk: caller/account khac workspace voi group thi bi
+        tu choi fail-closed + audit, khong go mot phan."""
         with self._lock:
             g = self._groups[group_id]
+            self._check_workspace("remove", g, account_ids,
+                                  workspace_id, accounts)
             drop = set(account_ids)
             g.account_ids = [a for a in g.account_ids if a not in drop]
+            self._audit("remove", g, workspace_id, account_ids, result="ok")
             return g
 
     def groups_of(self, account_id: str) -> list[AccountGroup]:
@@ -132,15 +246,35 @@ class NotificationCenter:
 
 @dataclass
 class WebhookNotifier:
-    """Telegram (chat_id qua URL bot) / Discord / generic webhook."""
+    """Telegram / Discord / generic webhook.
+
+    Telegram: ``chat_id`` la cau hinh rieng bat buoc (Bot API
+    sendMessage can chat_id + text). Neu chua dat, thu doc tham so
+    chat_id tren URL (tuong thich cau hinh cu); van khong co thi
+    notify() raise ValueError thay vi gui payload chac chan bi 400.
+    """
     kind: str  # telegram | discord | webhook
     url: str
     sender: Sender = _http_sender
+    chat_id: str = ""
+
+    def _telegram_chat_id(self) -> str:
+        if self.chat_id:
+            return str(self.chat_id)
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.url).query)
+        values = query.get("chat_id") or []
+        return str(values[0]) if values else ""
 
     def notify(self, alert: Alert) -> None:
         text = f"[{alert.severity.value.upper()}] {alert.title}: {alert.message}"
         if self.kind == "telegram":
-            payload = {"text": text}
+            chat_id = self._telegram_chat_id()
+            if not chat_id:
+                raise ValueError(
+                    "telegram notifier requires chat_id (config field "
+                    "or ?chat_id= on the URL) - refusing to send a "
+                    "payload the Bot API would reject with 400")
+            payload = {"chat_id": chat_id, "text": text}
         elif self.kind == "discord":
             payload = {"content": text}
         else:
@@ -153,15 +287,62 @@ class WebhookNotifier:
 
 @dataclass
 class MultiChannelNotifier:
+    """Gui alert qua nhieu kenh; 1 kenh loi khong chan kenh khac.
+
+    Loi gui kenh KHONG con chi nam trong list ``errors``: moi ket
+    qua deu duoc dem vao ``metrics`` ({"sent", "failed",
+    "by_channel": {ten_kenh: {"sent", "failed"}}}), loi ghi log
+    canh bao co cau truc va goi ``metrics_sink`` (channel_name,
+    exception, alert) neu duoc tiem — noi observability dem so lan
+    gui canh bao that bai. ``errors`` van giu de tuong thich.
+    """
     channels: list = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    metrics_sink: Optional[Callable[[str, Exception, Alert], None]] = None
+    metrics: dict = field(default_factory=lambda: {
+        "sent": 0, "failed": 0, "by_channel": {}})
+    _lock: threading.Lock = field(default_factory=threading.Lock,
+                                  repr=False, compare=False)
+
+    @property
+    def failure_count(self) -> int:
+        return self.metrics["failed"]
+
+    @staticmethod
+    def _channel_name(ch) -> str:
+        return str(getattr(ch, "kind", "") or type(ch).__name__)
+
+    def _record(self, name: str, ok: bool) -> None:
+        with self._lock:
+            bucket = self.metrics["by_channel"].setdefault(
+                name, {"sent": 0, "failed": 0})
+            if ok:
+                self.metrics["sent"] += 1
+                bucket["sent"] += 1
+            else:
+                self.metrics["failed"] += 1
+                bucket["failed"] += 1
 
     def notify(self, alert: Alert) -> None:
         for ch in self.channels:
+            name = self._channel_name(ch)
             try:
                 ch.notify(alert)
             except Exception as exc:  # 1 kenh loi khong chan kenh khac
                 self.errors.append(f"{type(ch).__name__}: {exc}")
+                self._record(name, ok=False)
+                _log.warning(json.dumps(
+                    {"level": "warning", "component": "alerts",
+                     "event": "alert_channel_failed", "channel": name,
+                     "alert_id": alert.id, "error": str(exc)},
+                    sort_keys=True))
+                if self.metrics_sink is not None:
+                    try:
+                        self.metrics_sink(name, exc, alert)
+                    except Exception:
+                        pass  # sink loi khong duoc lam hong notify
+            else:
+                self._record(name, ok=True)
 
 
 # ---------------------------------------------------------------- Rule engine
