@@ -1,0 +1,15 @@
+[
+  {
+    "platform": "tiktok",
+    "platform_video_id": "tt_video_001",
+    "title": "Sample TikTok",
+    "views": 50000,
+    "likes": 4200,
+    "comments": 310,
+    "shares": 190,
+    "saves": 260,
+    "watch_time_seconds": 0,
+    "source": "tiktok_api",
+    "quality": "ok"
+  }
+]

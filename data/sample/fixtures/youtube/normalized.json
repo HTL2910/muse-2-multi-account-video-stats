@@ -1,0 +1,15 @@
+[
+  {
+    "platform": "youtube",
+    "platform_video_id": "yt_video_001",
+    "title": "Sample YT Video",
+    "views": 98000,
+    "likes": 6100,
+    "comments": 540,
+    "shares": 0,
+    "saves": 0,
+    "watch_time_seconds": 0,
+    "source": "youtube_data_api",
+    "quality": "ok"
+  }
+]
