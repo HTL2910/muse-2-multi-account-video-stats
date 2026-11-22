@@ -5,9 +5,25 @@ schema chung trong ``src.contracts``; moi nen tang la mot Adapter.
 Khong goi truc tiep API nen tang tu core, khong log secret, fail-closed
 theo ``ALLOWED_ACCOUNT_TRANSITIONS`` / ``FAIL_CLOSED_STATUSES``.
 
-Chi dung thu vien chuan. Import contracts theo ca 2 cach (goi tu repo
-root ``src.contracts`` hoac goi trong package ``..contracts``) de
-module chay duoc ca khi chay ``python -m`` lan khi import tu root.
+Chi dung thu vien chuan. Import contracts theo DUY NHAT mot cach:
+``from src.contracts import ...`` chay tu repo root. Khong con khoi
+fallback hai kieu import nua (xem Fix).
+
+Fix (fix_import_dual_contracts_residual):
+- Bo khoi fallback hai kieu import contracts. Kieu du phong co the
+  nap cung mot file thanh module thu hai (module tran vs
+  ``src.contracts``), lam Enum/dataclass identity (``is`` /
+  ``isinstance``) am tham vo giua cac module — pytest khong bat duoc
+  vi no luon import qua ``src.*`` tu repo root. Gio chi con mot
+  import, mot identity.
+- Ghi chu: day la buoc co hoc cho rieng file nay. Cac file khac van
+  con fallback (ai, analytics, browser, observability/monitor, risk,
+  facebook_connector, scheduler, tiktok_connector) thuoc PR co hoc
+  toan src/ tiep theo — khong sua o nhanh nay.
+- Khong doi bat ky hanh vi nao khac. Dac biet InMemoryMetricsStore
+  .save_snapshot() van tra metric tran nhu tren main (loi kieu tra ve
+  VideoStatsSnapshot thuoc fix_core_store_return_type, chua merge,
+  khong sua o day).
 """
 from __future__ import annotations
 
@@ -19,54 +35,30 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Callable, Optional, Protocol
 
-try:  # repo root tren sys.path
-    from src.contracts import (  # type: ignore
-        ALLOWED_ACCOUNT_TRANSITIONS,
-        FAIL_CLOSED_STATUSES,
-        MAX_JOB_RETRIES,
-        AccountStatus,
-        AuthMethod,
-        CollectJob,
-        JobPriority,
-        JobStatus,
-        JobType,
-        MetricSource,
-        Platform,
-        PlatformAccount,
-        ProxyInfo,
-        ProxyStatus,
-        TokenSet,
-        UnifiedVideoMetric,
-        Video,
-        VideoStatus,
-        is_fail_closed_status,
-        utcnow,
-        validate_metric,
-    )
-except ImportError:  # goi nhu package src.core.*
-    from ..contracts import (  # type: ignore
-        ALLOWED_ACCOUNT_TRANSITIONS,
-        FAIL_CLOSED_STATUSES,
-        MAX_JOB_RETRIES,
-        AccountStatus,
-        AuthMethod,
-        CollectJob,
-        JobPriority,
-        JobStatus,
-        JobType,
-        MetricSource,
-        Platform,
-        PlatformAccount,
-        ProxyInfo,
-        ProxyStatus,
-        TokenSet,
-        UnifiedVideoMetric,
-        Video,
-        VideoStatus,
-        is_fail_closed_status,
-        utcnow,
-        validate_metric,
-    )
+# DUY NHAT mot cach import contract: tu repo root. Khong fallback.
+from src.contracts import (
+    ALLOWED_ACCOUNT_TRANSITIONS,
+    FAIL_CLOSED_STATUSES,
+    MAX_JOB_RETRIES,
+    AccountStatus,
+    AuthMethod,
+    CollectJob,
+    JobPriority,
+    JobStatus,
+    JobType,
+    MetricSource,
+    Platform,
+    PlatformAccount,
+    ProxyInfo,
+    ProxyStatus,
+    TokenSet,
+    UnifiedVideoMetric,
+    Video,
+    VideoStatus,
+    is_fail_closed_status,
+    utcnow,
+    validate_metric,
+)
 
 __all__ = [
     "SPLIT_ACCOUNT_THRESHOLD", "SPLIT_VIDEOS_PER_DAY_THRESHOLD",
