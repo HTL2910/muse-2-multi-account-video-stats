@@ -7,6 +7,18 @@ Derived metrics use sliding windows; anomaly detection uses a
 detrended z-score AND a small pure-python Isolation Forest (random
 partition trees, deterministic seed) — no sklearn dependency, so the
 module runs in CI without extra packages.
+
+Fix ``fix_timeseries_rollup_ddl``:
+- ``rollup()`` cache 300s theo (video_id, bucket_hours) nhung
+  ``save_snapshot()`` khong invalidate nen dashboard thay so cu toi
+  5 phut. Tu ban nay ghi snapshot moi se invalidate ngay moi rollup
+  da cache cua video do (moi bucket_hours).
+- DDL cu khai ``UNIQUE-on-idempotency_key-alone`` tren hypertable — bat hop
+  le tren TimescaleDB (unique index phai chua cot phan vung `time`),
+  va ngay ca ``UNIQUE-on-(time, idempotency_key)`` cung khong enforce
+  dedup theo gio (2 snapshot cung gio, khac `time` chinh xac, van
+  lot). Dedup gio song tren bang thuong ``idempotency_keys`` voi
+  PRIMARY KEY la snapshot_key theo gio.
 """
 from __future__ import annotations
 
@@ -40,6 +52,22 @@ __all__ = [
 TIMESCALE_DDL = """
 -- PostgreSQL: relational tables (accounts/videos) live in approach_02.
 -- TimescaleDB: hypertable for metrics, partitioned by time + platform.
+--
+-- Fix fix_timeseries_rollup_ddl: the old DDL declared
+--   UNIQUE-on-idempotency_key-alone
+-- on the hypertable. That is ILLEGAL on a TimescaleDB hypertable: a
+-- unique index must contain the partitioning column `time`
+-- (ERROR: "unique index ... must contain the partition column").
+-- Worse, even UNIQUE-on-(time, idempotency_key) would NOT enforce the
+-- hourly dedup from fix_idempotency_hourly_bucket: two snapshots in
+-- the same hour have the same snapshot_key but different exact `time`
+-- values, so both would be allowed. So dedup does NOT live on the
+-- hypertable at all. It lives on the plain (non-hypertable) table
+-- `idempotency_keys` below, whose PRIMARY KEY is the hourly
+-- snapshot_key: insert the key there first (ON CONFLICT DO NOTHING);
+-- only insert the metric row when the key was new. `video_metrics`
+-- keeps a `snapshot_key` column (same value as `idempotency_key`
+-- since contracts 1.1.0) for lookups, with a plain index.
 CREATE TABLE IF NOT EXISTS video_metrics (
   time TIMESTAMPTZ NOT NULL, video_id UUID NOT NULL, account_id UUID NOT NULL,
   platform TEXT NOT NULL, platform_video_id TEXT NOT NULL,
@@ -48,10 +76,27 @@ CREATE TABLE IF NOT EXISTS video_metrics (
   saves BIGINT NOT NULL DEFAULT 0, watch_time_seconds BIGINT NOT NULL DEFAULT 0,
   followers_delta INT NOT NULL DEFAULT 0, source TEXT NOT NULL,
   quality TEXT NOT NULL DEFAULT 'ok', idempotency_key TEXT NOT NULL,
-  UNIQUE (idempotency_key)
+  snapshot_key TEXT NOT NULL
 );
 SELECT create_hypertable('video_metrics', 'time', if_not_exists => TRUE);
 CREATE INDEX IF NOT EXISTS idx_metrics_video_time ON video_metrics (video_id, time DESC);
+CREATE INDEX IF NOT EXISTS idx_metrics_snapshot_key ON video_metrics (snapshot_key);
+-- Dedup table (plain PostgreSQL table, NOT a hypertable): the ONLY
+-- place that enforces hourly idempotency. snapshot_key is the hourly
+-- key from contracts 1.1.0 (account, platform_video, hour bucket).
+-- Write path: INSERT INTO idempotency_keys (...) VALUES (...)
+--   ON CONFLICT (snapshot_key) DO NOTHING;
+--   -- if no row was inserted, the snapshot is a duplicate: skip the
+--   -- video_metrics insert entirely.
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  snapshot_key TEXT PRIMARY KEY,
+  video_id UUID NOT NULL, account_id UUID NOT NULL,
+  platform_video_id TEXT NOT NULL,
+  time TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_idempotency_keys_video_time
+  ON idempotency_keys (video_id, time DESC);
 -- Rollups (continuous aggregates in prod): 1h / 1d, last value per bucket.
 -- Retention: compress chunks > 7d, drop/archive to object storage > 365d.
 -- SELECT add_compression_policy('video_metrics', INTERVAL '7 days');
@@ -112,6 +157,16 @@ class _TTLCache:
         import time
         self._store[key] = (time.monotonic(), value)
 
+    def delete(self, key: str) -> None:
+        self._store.pop(key, None)
+
+    def invalidate_prefix(self, prefix: str) -> int:
+        """Xoa tat ca key bat dau bang prefix. Tra ve so key da xoa."""
+        doomed = [k for k in self._store if k.startswith(prefix)]
+        for k in doomed:
+            del self._store[k]
+        return len(doomed)
+
 
 class TimeSeriesStore:
     """Append-only, idempotent metrics store (MetricsStore protocol)."""
@@ -120,6 +175,10 @@ class TimeSeriesStore:
         self._by_key: dict[str, VideoStatsSnapshot] = {}
         self._by_video: dict[str, list[UnifiedVideoMetric]] = defaultdict(list)
         self.cache = _TTLCache(cache_ttl_seconds)
+
+    def invalidate_rollup(self, video_id: str) -> int:
+        """Xoa moi rollup da cache cua 1 video (moi bucket_hours)."""
+        return self.cache.invalidate_prefix(f"rollup:{video_id}:")
 
     def save_snapshot(self, metric: UnifiedVideoMetric) -> VideoStatsSnapshot:
         errors = validate_metric(metric)
@@ -132,6 +191,13 @@ class TimeSeriesStore:
         self._by_key[key] = snap
         self._by_video[metric.video_id].append(metric)
         self._by_video[metric.video_id].sort(key=lambda m: m.collected_at)
+        # Fix fix_timeseries_rollup_cache_stale: rollup() cache 300s theo
+        # (video_id, bucket_hours) nhung save moi khong invalidate nen
+        # dashboard thay so cu toi 5 phut. Ghi moi -> xoa ngay rollup
+        # da cache cua video nay (moi bucket_hours); rollup ke tiep
+        # tinh lai tu du lieu moi. Duplicate (key da co) khong ghi moi
+        # nen khong can invalidate.
+        self.invalidate_rollup(metric.video_id)
         return snap
 
     def get_history(self, *, video_id: str, start: datetime, end: datetime) -> list[UnifiedVideoMetric]:
