@@ -16,20 +16,23 @@ Stdlib-only except the optional YAML parse and the optional real
 sibling test_fix_docker_compose_unrunnable).
 
 Windows CI note: the init_secrets test runs the script through the
-bash found on PATH (Git Bash/MSYS on the Windows runner). That bash
-cannot open a backslash Windows path (C:\\Users\\...) — the first CI
-run failed with "/bin/bash: C:\\...\\init_secrets.sh: No such file or
-directory" (exit 127) — so the test converts the path to POSIX form
-(/c/Users/...) and writes the script with LF line endings regardless
-of the checkout's autocrlf setting. The chmod-600 mode assertion is
-POSIX-only: Windows filesystems do not carry POSIX mode bits.
+bash found on PATH on the Windows runner, and NO host-path spelling
+survives that trip: a backslash path (C:\\Users\\...) failed CI run 1
+with exit 127, and the MSYS form (/c/Users/...) failed CI run 2 the
+same way (that bash is WSL, which mounts drives at /mnt/c/...). So
+the test never hands bash a path at all: it starts bash with
+cwd=<tmp>/scripts and invokes the script by its relative name
+("init_secrets.sh"), which resolves identically on POSIX, Git Bash
+and WSL. The script copy is also written with LF line endings
+regardless of the checkout's autocrlf setting. The chmod-600 mode
+assertion is POSIX-only: Windows filesystems do not carry POSIX
+mode bits.
 Run from repo root:  python -m pytest tests/test_fix_docker_compose_companions.py -q
 """
 from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import stat
 import subprocess
@@ -151,22 +154,19 @@ def test_worker_once_without_executor_idles_and_exits_clean():
 
 
 # --- init_secrets.sh really creates what compose expects ---------------------
-def _bash_path(path: Path) -> str:
-    """Path in the form the bash on PATH understands.
-
-    POSIX: unchanged. Windows (Git Bash/MSYS): C:\\Users\\x\\f.sh and
-    even C:/Users/x/f.sh are not openable by that bash — it wants the
-    MSYS form /c/Users/x/f.sh.
-    """
-    s = path.as_posix()
-    if os.name == "nt" and re.match(r"^[A-Za-z]:/", s):
-        s = "/" + s[0].lower() + s[2:]
-    return s
-
-
 def _run_init_secrets(script: Path) -> subprocess.CompletedProcess:
+    """Run the script through bash WITHOUT passing it a host path.
+
+    Host-path spellings do not survive the trip into the bash found
+    on a Windows runner (backslash form: rejected; /c/... MSYS form:
+    rejected by WSL bash, which mounts at /mnt/c/...). A relative
+    invocation with cwd set to the script's directory resolves the
+    same way on POSIX, Git Bash and WSL — and the script itself only
+    needs its own directory (it derives the repo root from
+    BASH_SOURCE's dirname), so nothing is lost.
+    """
     return subprocess.run(
-        ["bash", _bash_path(script)],
+        ["bash", script.name], cwd=str(script.parent),
         capture_output=True, text=True, timeout=60)
 
 
