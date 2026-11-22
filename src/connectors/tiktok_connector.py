@@ -21,6 +21,21 @@ any other write scope, and it never posts, likes or comments on behalf
 of the user — a write scope would let a leaked token publish content
 as the user and makes the OAuth app review fail for a stats-only
 product.
+
+Fix ``fix_tiktok_auth_fabricated``: ``authenticate()`` / ``refresh_token()``
+khong bao gio tra TokenSet gia nua. Truoc day ``authenticate()`` goi
+``/user/info/`` KHONG kem token, bat loi roi bo qua va tra TokenSet
+khong co access_token; ``refresh_token()`` tra TokenSet voi expires_at
++24h tu bia ma khong he POST ``/oauth/token/``. Tu ban nay:
+``authenticate()`` chi tra token THAT lay duoc tu mot trong hai nguon
+— doi auth code that qua POST ``/oauth/token/`` (grant_type=
+authorization_code), hoac TokenSet that do ``token_provider`` (Vault)
+cung cap — roi xac thuc no bang ``/user/info/`` CO kem Bearer token;
+``refresh_token()`` bat buoc POST ``/oauth/token/`` (grant_type=
+refresh_token) voi client_key/client_secret va chi tra access_token /
+refresh_token / expires_at THAT do TikTok tra ve. Khong co nguon token
+that nao thi raise ``TikTokAuthError`` (fail-closed), khong bao gio
+tra TokenSet rong hay expires_at tu bia.
 """
 from __future__ import annotations
 
@@ -199,6 +214,8 @@ class QuotaTracker:
 class _HttpClient(Protocol):
     def get(self, url: str, headers: dict[str, str], params: dict[str, Any]) -> tuple[int, dict[str, Any]]: ...
 
+    def post(self, url: str, headers: dict[str, str], data: dict[str, Any]) -> tuple[int, dict[str, Any]]: ...
+
 
 class _UrllibClient:
     """Default stdlib client. Proxy is passed via ProxyInfo address if given."""
@@ -207,15 +224,32 @@ class _UrllibClient:
         self.proxy_url = proxy_url
         self.timeout = timeout
 
+    def _opener(self):
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": self.proxy_url, "https": self.proxy_url})
+            if self.proxy_url else urllib.request.ProxyHandler({}))
+
     def get(self, url, headers, params):
         qs = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
         full = f"{url}?{qs}" if qs else url
         req = urllib.request.Request(full, headers=headers, method="GET")
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": self.proxy_url, "https": self.proxy_url})
-            if self.proxy_url else urllib.request.ProxyHandler({}))
         try:
-            with opener.open(req, timeout=self.timeout) as resp:
+            with self._opener().open(req, timeout=self.timeout) as resp:
+                return resp.status, json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            try:
+                body = json.loads(e.read() or b"{}")
+            except Exception:
+                body = {}
+            return e.code, body
+
+    def post(self, url, headers, data):
+        # OAuth token endpoint nhan form-encoded (x-www-form-urlencoded).
+        body = urllib.parse.urlencode({k: v for k, v in data.items() if v is not None}).encode()
+        h = {"Content-Type": "application/x-www-form-urlencoded", **headers}
+        req = urllib.request.Request(url, data=body, headers=h, method="POST")
+        try:
+            with self._opener().open(req, timeout=self.timeout) as resp:
                 return resp.status, json.loads(resp.read() or b"{}")
         except urllib.error.HTTPError as e:
             try:
@@ -227,7 +261,15 @@ class _UrllibClient:
 
 @dataclass
 class TikTokConnector:
-    """PlatformAdapter for TikTok. `http` is injectable for tests / golden fixtures."""
+    """PlatformAdapter for TikTok. `http` is injectable for tests / golden fixtures.
+
+    ``client_key`` / ``client_secret`` la OAuth app credentials cua
+    caller (lay tu env/Vault, khong bao gio log, khong de trong repr);
+    ``token_provider`` la ham Vault-backed ``(account) -> TokenSet``
+    tra ve token that da luu (giai ma tu ``credential_ref``). Khong
+    co ca hai nguon thi ``authenticate()`` / ``refresh_token()``
+    raise ``TikTokAuthError`` thay vi tra token gia.
+    """
 
     platform: Platform = PLATFORM
     base_url: str = BASE_URL
@@ -236,6 +278,9 @@ class TikTokConnector:
     max_concurrency: int = 2
     jitter_seconds: tuple[float, float] = (0.5, 2.0)
     _rng: random.Random = field(default_factory=lambda: random.Random(42), repr=False)
+    client_key: Optional[str] = field(default=None, repr=False)
+    client_secret: Optional[str] = field(default=None, repr=False)
+    token_provider: Optional[Callable[[PlatformAccount], Optional[TokenSet]]] = field(default=None, repr=False)
 
     def _client(self, account: PlatformAccount) -> _HttpClient:
         return self.http or _UrllibClient()
@@ -268,6 +313,8 @@ class TikTokConnector:
     def _api_get(self, account: PlatformAccount, path: str, *,
                  tokens: Optional[TokenSet] = None,
                  params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        if tokens is not None:
+            self._require_real_token(tokens, context=f"GET {path}")
         if not self.quota.allow():
             raise TikTokRateLimitError("TikTok app quota exhausted", retry_after_seconds=60)
         self._require_token(account)
@@ -277,19 +324,131 @@ class TikTokConnector:
         self._check_error(status, body)
         return body
 
-    def authenticate(self, account: PlatformAccount) -> TokenSet:
-        """Login Kit OAuth: the real exchange needs the auth code from the
-        user flow; this method validates the stored credential and returns
-        a TokenSet placeholder only when a vault token exists. It never
-        fabricates a token and never logs one."""
+    # -- Auth that (fail-closed) -------------------------------------------
+    @staticmethod
+    def _require_real_token(tokens: Optional[TokenSet], *, context: str) -> TokenSet:
+        """Guard chung: token tra ve / truyen vao phai co access_token
+        non-empty va chua het han. Token gia / het han -> TikTokAuthError."""
+        if tokens is None or not tokens.access_token:
+            raise TikTokAuthError(
+                f"{context}: token has no access_token — refusing to use a fabricated token",
+                code="missing_access_token")
+        if tokens.is_expired():
+            raise TikTokAuthError(
+                f"{context}: token already expired at {tokens.expires_at}",
+                code="token_expired")
+        return tokens
+
+    def _require_client_credentials(self) -> tuple[str, str]:
+        if not self.client_key or not self.client_secret:
+            raise TikTokAuthError(
+                "no TikTok OAuth client credentials configured (client_key/client_secret) — "
+                "cannot exchange/refresh a token without them",
+                code="missing_client_credentials")
+        return self.client_key, self.client_secret
+
+    def _parse_token_response(self, body: dict[str, Any], *,
+                              refresh_token: Optional[str] = None,
+                              scopes: Optional[list[str]] = None) -> TokenSet:
+        """Parse phan hoi that cua /oauth/token/. KHONG BAO GIO bia
+        expires_at: thieu access_token hoac expires_in hop le thi raise."""
+        data = body.get("data") if isinstance(body.get("data"), dict) else body
+        access_token = str(data.get("access_token") or "").strip()
+        if not access_token:
+            raise TikTokAuthError(
+                "token endpoint did not return an access_token",
+                code="missing_access_token")
+        expires_in = _int(data.get("expires_in"), 0)
+        if expires_in <= 0:
+            raise TikTokAuthError(
+                "token endpoint did not return a valid expires_in — "
+                "refusing to invent an expiry",
+                code="missing_expires_in")
+        expires_at = utcnow() + timedelta(seconds=expires_in)
+        if expires_at <= utcnow():
+            raise TikTokAuthError("token endpoint returned an already-expired token",
+                                  code="token_expired")
+        new_refresh = str(data.get("refresh_token") or "").strip() or refresh_token
+        scope = str(data.get("scope") or "")
+        parsed_scopes = [s for s in scope.replace(",", " ").split() if s] or list(scopes or REQUIRED_SCOPES)
+        return TokenSet(
+            access_token=access_token,
+            refresh_token=new_refresh or None,
+            token_type=str(data.get("token_type") or "Bearer"),
+            expires_at=expires_at,
+            scopes=parsed_scopes,
+        )
+
+    def _oauth_token(self, account: PlatformAccount, data: dict[str, Any], *,
+                     refresh_token: Optional[str] = None,
+                     scopes: Optional[list[str]] = None) -> TokenSet:
+        """POST that toi /oauth/token/ va parse phan hoi that."""
+        client = self._client(account)
+        post = getattr(client, "post", None)
+        if post is None:
+            raise TikTokAPIError("http client does not support POST (needed for /oauth/token/)",
+                                 code="no_post_support")
+        status, body = post(f"{self.base_url}/oauth/token/", {}, data)
+        self._check_error(status, body)
+        return self._parse_token_response(body, refresh_token=refresh_token, scopes=scopes)
+
+    def _validate_token_live(self, account: PlatformAccount, tokens: TokenSet) -> TokenSet:
+        """Chung minh token THAT dung duoc: goi /user/info/ CO kem
+        Bearer token. Loi auth truyen thang len; loi API khac cung
+        khong duoc nuot — token chua duoc chung minh thi khong tra ve."""
+        self._api_get(account, "/user/info/", tokens=tokens,
+                      params={"fields": "open_id,display_name"})
+        return tokens
+
+    def authenticate(self, account: PlatformAccount, *,
+                     auth_code: Optional[str] = None,
+                     tokens: Optional[TokenSet] = None,
+                     token_provider: Optional[Callable[[PlatformAccount], Optional[TokenSet]]] = None
+                     ) -> TokenSet:
+        """Lay token THAT cho account, roi xac thuc no bang /user/info/.
+
+        Nguon token (uu tien theo thu tu):
+        1. ``auth_code``: doi code that qua POST /oauth/token/
+           (grant_type=authorization_code) — can client_key/secret.
+        2. ``tokens``: TokenSet that caller da co (vd vua doi o buoc
+           Login Kit), duoc xac thuc live truoc khi tra ve.
+        3. ``token_provider`` (tham so hoac field cua connector):
+           ham Vault-backed tra ve TokenSet da luu; neu token da het
+           han ma co refresh_token thi tu refresh that truoc.
+        Khong co nguon nao -> raise TikTokAuthError. Khong bao gio
+        tra TokenSet rong hay tu bia expires_at.
+        """
         self._require_token(account)
-        try:
-            self._api_get(account, "/user/info/", params={"fields": "open_id,display_name"})
-        except TikTokAuthError:
-            raise
-        except TikTokAPIError:
-            pass
-        return TokenSet(scopes=list(REQUIRED_SCOPES))
+        if auth_code is not None:
+            client_key, client_secret = self._require_client_credentials()
+            exchanged = self._oauth_token(account, {
+                "client_key": client_key, "client_secret": client_secret,
+                "code": auth_code, "grant_type": "authorization_code",
+            })
+            return self._validate_token_live(account, exchanged)
+        if tokens is not None:
+            self._require_real_token(tokens, context="authenticate")
+            return self._validate_token_live(account, tokens)
+        provider = token_provider or self.token_provider
+        if provider is not None:
+            stored = provider(account)
+            if stored is None:
+                raise TikTokAuthError(
+                    "token_provider returned no TokenSet for this account",
+                    code="missing_access_token")
+            if stored.is_expired():
+                if not stored.refresh_token:
+                    raise TikTokAuthError(
+                        "stored token expired and no refresh_token available",
+                        code="token_expired")
+                refreshed = self.refresh_token(account, stored)
+                return self._validate_token_live(account, refreshed)
+            self._require_real_token(stored, context="authenticate")
+            return self._validate_token_live(account, stored)
+        raise TikTokAuthError(
+            "cannot authenticate: no auth_code, no TokenSet and no "
+            "token_provider (Vault) configured — refusing to fabricate a token",
+            code="no_token_source")
 
     def check_alive(self, account: PlatformAccount) -> bool:
         try:
@@ -328,10 +487,22 @@ class TikTokConnector:
         return map_metric(raw, video=video, account=account, source=MetricSource.TIKTOK_API)
 
     def refresh_token(self, account: PlatformAccount, tokens: TokenSet) -> TokenSet:
+        """Refresh THAT qua POST /oauth/token/ (grant_type=refresh_token).
+
+        Chi tra access_token / refresh_token / expires_at do TikTok
+        tra ve trong phan hoi; token moi duoc xac thuc live bang
+        /user/info/ truoc khi tra ve. Thieu refresh_token, thieu
+        client credentials, hay phan hoi thieu access_token /
+        expires_in hop le deu raise TikTokAuthError.
+        """
         if not tokens.refresh_token:
             raise TikTokAuthError("no refresh_token available", code="missing_refresh_token")
-        return TokenSet(refresh_token=tokens.refresh_token, scopes=list(tokens.scopes),
-                        expires_at=utcnow() + timedelta(hours=24))
+        client_key, client_secret = self._require_client_credentials()
+        exchanged = self._oauth_token(account, {
+            "client_key": client_key, "client_secret": client_secret,
+            "grant_type": "refresh_token", "refresh_token": tokens.refresh_token,
+        }, refresh_token=tokens.refresh_token, scopes=list(tokens.scopes) or None)
+        return self._validate_token_live(account, exchanged)
 
     def get_video_stats_supplemental(self, account: PlatformAccount, video: Video,
                                      *, browser_fetcher: Optional[Callable[[Video], dict[str, Any]]] = None
