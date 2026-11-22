@@ -1,4 +1,4 @@
-` vì quy ước nộp file chỉ biết ghi nội dung, bất kỳ khối nào cũng tái tạo lại file mà hội đồng đã chốt xóa và làm guard dưới đây đỏ. Đã xác nhận `docs/ARCHITECTURE.md` và `README.md` không chứa tham chiếu nào tới registry. Guard đã kiểm chứng 3 trạng thái trên VM: file đã xóa → 3 passed; file còn → 3 fail; còn import treo → đúng test tham chiếu fail.
+` vì quy ước nộp file chỉ biết ghi nội dung, bất kỳ khối nào cũng tái tạo file mà hội đồng đã chốt xóa. Đã xác nhận `docs/ARCHITECTURE.md` và `README.md` không có tham chiếu nào tới registry; guard đã kiểm chứng 3 trạng thái (file đã xóa → 3 passed; file còn → 3 fail; còn import treo → test tham chiếu fail).
 
 [[FILE tests/test_fix_registry_dead_code.py]]
 """Regression guard for fix_registry_dead_code.

@@ -528,7 +528,9 @@ def test_collect_sample_data_golden_cases_cover_all_platforms():
     mod = _load_collect()
     cases = mod.build_golden_cases()
     assert {c["platform"] for c in cases} == {"facebook", "tiktok", "youtube"}
-    expected_views = {"facebook": 12000, "tiktok": 50000, "youtube": 98000}
+    # Canonical views per data/golden/cases.json (fix_golden_path_a:
+    # the script's builders mirror the parser-owned golden fixtures).
+    expected_views = {"facebook": 100, "tiktok": 1000, "youtube": 98000}
     for case in cases:
         # The case is self-consistent: expected metric == normalize of
         # the module's own synthetic raw fixture (normalize returns a
