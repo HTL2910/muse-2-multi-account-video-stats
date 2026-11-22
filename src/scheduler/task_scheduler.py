@@ -16,6 +16,12 @@ Rang buoc bat buoc:
   (weighted fair scheduling), jitter ngau nhien chong dong loat.
 Fail-closed: account/proxy o trang thai fail-closed -> job REJECTED,
 khong enqueue lai, khong dung proxy mac dinh cua account khac.
+Fix ``fix_scheduler_enqueue_fail_open``: trang thai KHONG BIET khong
+con duoc coi la ACTIVE. Account chua dang ky/chua dong bo trang thai,
+hoac proxy da bind nhung chua ro trang thai, deu bi REJECTED o enqueue
+(va ca o requeue_dead_letter). Caller phai dang ky trang thai that qua
+``register_account`` / ``register_proxy`` / ``sync_statuses`` /
+``sync_from_store`` hoac truyen trang thai tuong minh vao ``enqueue``.
 """
 from __future__ import annotations
 
@@ -28,7 +34,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 try:
     from src.contracts import (  # type: ignore
@@ -54,6 +60,9 @@ NEW_VIDEO_INTERVAL = timedelta(minutes=15)
 OLD_VIDEO_INTERVAL = timedelta(hours=6)   # video cu: 6-12h, mac dinh 6h
 LEASE_SECONDS = 300
 HEARTBEAT_SECONDS = 60
+
+# Proxy chi dung duoc o hai trang thai nay; QUARANTINED/DEAD -> REJECTED.
+_USABLE_PROXY_STATUSES = frozenset({ProxyStatus.ACTIVE, ProxyStatus.WARMUP})
 
 
 class TokenBucket:
@@ -243,7 +252,10 @@ class TaskSchedulerImpl:
     def __init__(self, *, workers: Optional[list[str]] = None,
                  quota: Optional[QuotaManager] = None,
                  rng: Optional[random.Random] = None,
-                 clock: Callable[[], datetime] = utcnow):
+                 clock: Callable[[], datetime] = utcnow,
+                 account_status: Optional[dict[str, AccountStatus]] = None,
+                 proxy_status: Optional[dict[str, ProxyStatus]] = None,
+                 account_proxy: Optional[dict[str, str]] = None):
         self.workers = workers or ["worker-1"]
         self.ring = ConsistentHashRing(self.workers)
         self.quota = quota or QuotaManager()
@@ -252,15 +264,125 @@ class TaskSchedulerImpl:
         self.dead_letter = DeadLetterQueue()
         self._rng = rng or random.Random()
         self._clock = clock
-        # Trang thai account/proxy do nguoi goi cap nhat (fail-closed gate o enqueue).
-        self.account_status: dict[str, AccountStatus] = {}
-        self.proxy_status: dict[str, ProxyStatus] = {}
+        # Trang thai account/proxy THAT, do store/caller dang ky hoac dong
+        # bo vao (xem register_*/sync_*). Mac dinh RONG = chua biet, va
+        # chua biet thi fail-closed o enqueue - KHONG mac dinh ACTIVE.
+        self.account_status: dict[str, AccountStatus] = dict(account_status or {})
+        self.proxy_status: dict[str, ProxyStatus] = dict(proxy_status or {})
+        # account_id -> proxy_id cua proxy sticky da bind (neu co).
+        self.account_proxy: dict[str, str] = dict(account_proxy or {})
+
+    # -- Dang ky / dong bo trang thai that -------------------------------
+    def set_account_status(self, account_id: str, status: AccountStatus) -> None:
+        self.account_status[account_id] = status
+
+    # Alias de caller cu/doc de hieu.
+    update_account_status = set_account_status
+
+    def set_proxy_status(self, proxy_id: str, status: ProxyStatus) -> None:
+        self.proxy_status[proxy_id] = status
+
+    update_proxy_status = set_proxy_status
+
+    def register_account(self, account: PlatformAccount, *,
+                         proxy_status: Optional[ProxyStatus] = None) -> PlatformAccount:
+        """Dang ky 1 account that: trang thai + proxy sticky cua no."""
+        self.account_status[account.id] = account.status
+        if account.proxy_binding_id:
+            self.account_proxy[account.id] = account.proxy_binding_id
+            if proxy_status is not None:
+                self.proxy_status[account.proxy_binding_id] = proxy_status
+        return account
+
+    def register_proxy(self, proxy: ProxyInfo) -> ProxyInfo:
+        self.proxy_status[proxy.id] = proxy.status
+        return proxy
+
+    def sync_statuses(self, *, accounts: Iterable[PlatformAccount] = (),
+                      proxies: Iterable[ProxyInfo] = ()) -> None:
+        for account in accounts:
+            self.register_account(account)
+        for proxy in proxies:
+            self.register_proxy(proxy)
+
+    def sync_account_status(self, mapping: dict[str, AccountStatus]) -> None:
+        """Dong bo nhanh trang thai account tu mot dict cua store that."""
+        self.account_status.update(mapping)
+
+    def sync_proxy_status(self, mapping: dict[str, ProxyStatus]) -> None:
+        """Dong bo nhanh trang thai proxy tu mot dict cua store that."""
+        self.proxy_status.update(mapping)
+
+    def sync_from_store(self, store: Any) -> None:
+        """Dong bo trang thai tu store that cua caller.
+
+        Chap nhan: dict {id: PlatformAccount|ProxyInfo}, iterable cac
+        PlatformAccount/ProxyInfo, hoac object co thuoc tinh ``accounts``
+        / ``proxies`` (list hoac dict). Store la nguon su that - scheduler
+        khong tu suy doan trang thai cua account/proxy ngoai store nay.
+        """
+        accounts = getattr(store, "accounts", None)
+        proxies = getattr(store, "proxies", None)
+        if accounts is not None or proxies is not None:
+            self.sync_statuses(
+                accounts=list(accounts.values()) if isinstance(accounts, dict) else list(accounts or []),
+                proxies=list(proxies.values()) if isinstance(proxies, dict) else list(proxies or []))
+            return
+        items = list(store.values()) if isinstance(store, dict) else list(store)
+        self.sync_statuses(
+            accounts=[x for x in items if isinstance(x, PlatformAccount)],
+            proxies=[x for x in items if isinstance(x, ProxyInfo)])
+
+    # -- Cong fail-closed dung chung cho enqueue / requeue ----------------
+    def _resolve_proxy_id(self, job: CollectJob,
+                          proxy_id: Optional[str] = None) -> Optional[str]:
+        if proxy_id:
+            return proxy_id
+        payload = job.payload or {}
+        for key in ("proxy_id", "proxy_binding_id"):
+            if payload.get(key):
+                return str(payload[key])
+        return self.account_proxy.get(job.account_id)
+
+    def _gate_reason(self, job: CollectJob, *,
+                     proxy_id: Optional[str] = None) -> Optional[str]:
+        """None = duoc enqueue. Chuoi = ly do REJECTED (fail-closed)."""
+        status = self.account_status.get(job.account_id)
+        if status is None:
+            return "unknown account status - fail-closed"
+        if is_fail_closed_status(status):
+            return f"fail-closed account status: {status.value}"
+        pid = self._resolve_proxy_id(job, proxy_id)
+        if pid is not None:
+            pstatus = self.proxy_status.get(pid)
+            if pstatus is None:
+                return "unknown proxy status - fail-closed"
+            if pstatus not in _USABLE_PROXY_STATUSES:
+                return f"proxy not usable: {pstatus.value}"
+        return None
 
     # -- TaskScheduler protocol -------------------------------------------
-    def enqueue(self, job: CollectJob) -> CollectJob:
-        if is_fail_closed_status(self.account_status.get(job.account_id, AccountStatus.ACTIVE)):
+    def enqueue(self, job: CollectJob, *,
+                account_status: Optional[AccountStatus] = None,
+                proxy_id: Optional[str] = None,
+                proxy_status: Optional[ProxyStatus] = None) -> CollectJob:
+        """Dua job vao queue - fail-closed voi trang thai chua biet.
+
+        Caller co the truyen trang thai tuong minh cho lan enqueue nay
+        (duoc ghi nhan nhu mot lan dong bo tu store that); neu khong,
+        scheduler chi tin trang thai da dang ky/dong bo truoc do.
+        """
+        if account_status is not None:
+            self.account_status[job.account_id] = account_status
+        if proxy_status is not None:
+            pid = self._resolve_proxy_id(job, proxy_id)
+            if pid is not None:
+                self.proxy_status[pid] = proxy_status
+                self.account_proxy.setdefault(job.account_id, pid)
+        reason = self._gate_reason(job, proxy_id=proxy_id)
+        if reason is not None:
             job.status = JobStatus.REJECTED
-            job.last_error = "fail-closed account status"
+            job.last_error = reason
             return job
         # Queue rieng theo platform; job mac dinh PENDING.
         job.status = JobStatus.PENDING
@@ -270,7 +392,14 @@ class TaskSchedulerImpl:
     def requeue_dead_letter(self, job_id: str) -> CollectJob:
         for i, job in enumerate(self.dead_letter.jobs):
             if job.id == job_id:
+                # Requeue cung la mot lan enqueue: cung phai qua cong
+                # fail-closed (account co the da BANNED tu luc job chet).
+                reason = self._gate_reason(job)
                 del self.dead_letter.jobs[i]
+                if reason is not None:
+                    job.status = JobStatus.REJECTED
+                    job.last_error = reason
+                    return job
                 job.attempts = 0
                 job.status = JobStatus.PENDING
                 self.queues[job.platform].push(job)
