@@ -50,10 +50,24 @@ fix_browser_profile_geo_always_us x2 + fix_profile_close_loses_runtime):
   os.getpgid (ban dau goi thang gay AttributeError tren may chay
   test Windows) nen dung taskkill /T /F, du phong os.kill, va moi
   loi ket thuc deu duoc nuot de close() khong bao gio crash vi pid cu.
+
+Fix ``fix_sqlite_manual_queue_connection_leak``: SQLiteManualQueue
+truoc day dung mau ``with self._connect() as conn:`` voi _connect()
+tra Connection tho — nhung __exit__ cua sqlite3.Connection chi
+commit/rollback, KHONG close, nen moi thao tac ro 1 file descriptor
+(chi duoc cyclic GC don vao luc khong xac dinh); tren Windows handle
+con mo chan unlink file manual_queue.sqlite3 (WinError 32 khi
+TemporaryDirectory don dep, lam 3 test profile do o teardown). Nay
+_connect() la mot contextmanager: commit khi khoi with thanh cong,
+rollback khi co exception, va LUAN close() trong finally — dong xac
+dinh theo tung thao tac, moi call site giu nguyen. Them close() o
+manager/fixture la khong du vi connection ro la connection tam cua
+tung thao tac, khong con tham chieu nao de dong ho.
 """
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
 import json
 import logging
 import math
@@ -197,8 +211,9 @@ class ManualQueueStore(Protocol):
 
 class SQLiteManualQueue:
     """ManualQueueStore bang SQLite (stdlib). Moi thao tac mo mot
-    connection ngan va commit ngay — muc cho khong bao gio chi nam
-    trong RAM. Trang thai: PENDING -> IN_PROGRESS (claim, attempts+1)
+    connection ngan, commit ngay va DONG ngay trong finally cua
+    _connect() (xem fix_sqlite_manual_queue_connection_leak) — muc
+    cho khong bao gio chi nam trong RAM va khong bao gio ro FD. Trang thai: PENDING -> IN_PROGRESS (claim, attempts+1)
     -> DONE (complete) hoac quay lai PENDING/FAILED (fail theo
     max_attempts). Enqueue trung (account_id, kind) dang cho thi tra
     ve id cu — retry o caller khong nhan doi hang doi."""
@@ -214,10 +229,32 @@ class SQLiteManualQueue:
                 " status TEXT NOT NULL DEFAULT 'PENDING', attempts INTEGER NOT NULL DEFAULT 0,"
                 " created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_error TEXT DEFAULT '')")
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self):
+        """Context manager cho MOT thao tac SQLite: mo connection,
+        yield cho call site, commit khi khoi with thoat binh thuong,
+        rollback khi co exception, va LUON close() trong finally.
+
+        Ly do phai tu dong tay: ``with sqlite3.connect(...) as conn``
+        chi commit/rollback chu khong close, nen ban truoc ro 1 FD
+        sau moi thao tac. Call site giu nguyen dang
+        ``with self._connect() as conn:`` — khac biet la gio conn
+        duoc dong xac dinh ngay khi khoi with ket thuc, ke ca khi
+        call site return som hay nem exception.
+        """
         conn = sqlite3.connect(self._path)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            yield conn
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    # Alias theo ten goi trong phuong an fix cua hoi dong.
+    _session = _connect
 
     @staticmethod
     def _row(row: sqlite3.Row) -> dict:
