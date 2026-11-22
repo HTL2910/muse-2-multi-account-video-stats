@@ -22,6 +22,18 @@ hoac proxy da bind nhung chua ro trang thai, deu bi REJECTED o enqueue
 (va ca o requeue_dead_letter). Caller phai dang ky trang thai that qua
 ``register_account`` / ``register_proxy`` / ``sync_statuses`` /
 ``sync_from_store`` hoac truyen trang thai tuong minh vao ``enqueue``.
+Fix ``fix_scheduler_quota_proxy_per_account``: quota chi tru MOT LAN,
+o MOT diem duy nhat ``QuotaManager.try_acquire()``. Truoc day
+``acquire_job`` goi ``acquire_proxy_slot()`` (tang _proxy_running)
+roi goi ``allow()`` (lai kiem tra _proxy_running >= limit) nen gioi
+han thuc luon bang cau hinh tru 1 (limit=1 thi khong job nao chay);
+``_account_buckets`` duoc tao nhung ``allow()`` khong bao gio dung.
+Tu ban nay: ``allow()`` chi la peek khong co tac dung phu (khong tru
+token, khong tang proxy); ``try_acquire()`` kiem tra ca 3 lop
+(account / proxy / platform) truoc, roi moi tru token + tang proxy
+nguyen tu duoi lock, that bai thi khong tru gi ca. Lop per-account
+la token bucket that, moi account 1 bucket rieng theo
+``per_account_quota_per_day``.
 """
 from __future__ import annotations
 
@@ -210,35 +222,109 @@ class DeadLetterQueue:
 
 @dataclass
 class QuotaManager:
-    """Rate-limit 3 lop: per-account, per-proxy, per-platform (token bucket)."""
+    """Rate-limit 3 lop: per-account, per-proxy, per-platform (token bucket).
+
+    Diem tru duy nhat la ``try_acquire()``: kiem tra ca 3 lop truoc
+    (duoi lock), roi moi tru 1 token account + 1 token platform va
+    tang ``_proxy_running`` — that bai o bat ky lop nao thi khong tru
+    gi ca. ``allow()`` chi la peek khong co tac dung phu, dung de
+    kiem tra truoc khi quyet dinh, khong phai de tru quota.
+    ``acquire_proxy_slot()`` giu lai de tuong thich nguoc cho caller
+    tu quan ly slot thu cong; duong chay cua scheduler KHONG dung no
+    nua (dung ``try_acquire()``), vi goi ca hai se dem proxy 2 lan.
+    ``per_account_quota_per_day`` mac dinh bang
+    ``per_platform_quota_per_day`` (1 account dung 1 minh co the dung
+    het quota platform, nhung nhieu account cong lai van bi platform
+    chan); muon gioi han rieng tung account thi truyen dict nho hon.
+    """
 
     per_platform_quota_per_day: dict[Platform, int] = field(default_factory=lambda: {
         Platform.FACEBOOK: 200, Platform.TIKTOK: 1000, Platform.YOUTUBE: 10_000,
     })
     per_proxy_concurrency: int = 2
+    per_account_quota_per_day: Optional[dict[Platform, int]] = None
+    clock: Callable[[], float] = time.monotonic
 
     def __post_init__(self) -> None:
+        if self.per_account_quota_per_day is None:
+            self.per_account_quota_per_day = dict(self.per_platform_quota_per_day)
         self._platform_buckets = {
-            p: TokenBucket(rate=q / 86400.0, capacity=float(q))
+            p: TokenBucket(rate=q / 86400.0, capacity=float(q), clock=self.clock)
             for p, q in self.per_platform_quota_per_day.items()
         }
         self._account_buckets: dict[str, TokenBucket] = {}
         self._proxy_running: dict[str, int] = {}
+        self._mu = threading.Lock()
+
+    def _account_bucket(self, account_id: str, platform: Platform) -> TokenBucket:
+        bucket = self._account_buckets.get(account_id)
+        if bucket is None:
+            quota = (self.per_account_quota_per_day or {}).get(
+                platform, self.per_platform_quota_per_day.get(platform, 0)
+            )
+            bucket = TokenBucket(rate=quota / 86400.0, capacity=float(quota), clock=self.clock)
+            self._account_buckets[account_id] = bucket
+        return bucket
+
+    @staticmethod
+    def _has_token(bucket: TokenBucket, n: float = 1.0) -> bool:
+        """Peek: co du token khong, khong tru token."""
+        return bucket.wait_seconds(n) == 0.0
 
     def allow(self, *, account_id: str, platform: Platform, proxy_id: Optional[str]) -> bool:
-        if proxy_id and self._proxy_running.get(proxy_id, 0) >= self.per_proxy_concurrency:
-            return False
-        bucket = self._platform_buckets[platform]
-        return bucket.try_consume(1.0)
+        """Peek khong co tac dung phu: co cho chay 1 job moi khong?
+
+        Kiem tra ca 3 lop nhung KHONG tru token, KHONG tang proxy.
+        Dung de hien thi / quyet dinh, khong dung thay cho
+        ``try_acquire()`` trong duong chay that.
+        """
+        with self._mu:
+            if proxy_id and self._proxy_running.get(proxy_id, 0) >= self.per_proxy_concurrency:
+                return False
+            if not self._has_token(self._account_bucket(account_id, platform)):
+                return False
+            return self._has_token(self._platform_buckets[platform])
+
+    def try_acquire(self, *, account_id: str, platform: Platform, proxy_id: Optional[str]) -> bool:
+        """Nguyen tu: kiem tra 3 lop, neu du thi tru quota + giu slot.
+
+        Tra True neu job duoc chay (da tru 1 token account, 1 token
+        platform, va +1 proxy_running neu co proxy). Tra False neu
+        bat ky lop nao het — khong tru gi ca. Moi lan True phai co
+        dung 1 lan ``release_proxy_slot()`` tuong ung o ``finish_job``.
+        """
+        with self._mu:
+            if proxy_id and self._proxy_running.get(proxy_id, 0) >= self.per_proxy_concurrency:
+                return False
+            account_bucket = self._account_bucket(account_id, platform)
+            platform_bucket = self._platform_buckets[platform]
+            if not self._has_token(account_bucket):
+                return False
+            if not self._has_token(platform_bucket):
+                return False
+            # Ca 3 lop deu du: bay gio moi tru, chi tru 1 lan.
+            account_bucket.try_consume(1.0)
+            platform_bucket.try_consume(1.0)
+            if proxy_id:
+                self._proxy_running[proxy_id] = self._proxy_running.get(proxy_id, 0) + 1
+            return True
 
     def acquire_proxy_slot(self, proxy_id: str) -> bool:
-        if self._proxy_running.get(proxy_id, 0) >= self.per_proxy_concurrency:
-            return False
-        self._proxy_running[proxy_id] = self._proxy_running.get(proxy_id, 0) + 1
-        return True
+        """Giu slot proxy thu cong (legacy). Scheduler dung
+        ``try_acquire()`` thay vi ham nay; goi ca hai se dem 2 lan."""
+        with self._mu:
+            if self._proxy_running.get(proxy_id, 0) >= self.per_proxy_concurrency:
+                return False
+            self._proxy_running[proxy_id] = self._proxy_running.get(proxy_id, 0) + 1
+            return True
 
     def release_proxy_slot(self, proxy_id: str) -> None:
-        self._proxy_running[proxy_id] = max(0, self._proxy_running.get(proxy_id, 0) - 1)
+        with self._mu:
+            self._proxy_running[proxy_id] = max(0, self._proxy_running.get(proxy_id, 0) - 1)
+
+    # Alias ro nghia hon cho release: chi giai phong slot proxy,
+    # khong hoan token quota da tru (token da dung thi khong tra lai).
+    release = release_proxy_slot
 
 
 def _jittered_delay(base_seconds: float, rng: random.Random) -> float:
@@ -412,7 +498,13 @@ class TaskSchedulerImpl:
 
     def acquire_job(self, *, worker_id: str, platform: Platform,
                     proxy_id: Optional[str] = None) -> Optional[CollectJob]:
-        """Lay job tiep theo cho worker, ton trong quota + lock per-account."""
+        """Lay job tiep theo cho worker, ton trong quota + lock per-account.
+
+        Quota chi tru 1 lan, o 1 diem duy nhat: ``quota.try_acquire()``.
+        Khong goi rieng ``acquire_proxy_slot()`` roi ``allow()`` nua
+        (do la goc cua loi off-by-one). Neu try_acquire that bai thi
+        chua tru gi ca nen khong can release slot.
+        """
         queue = self.queues[platform]
         # Thu lan luot (queue nho trong test/dev; production dung peek/pop co dieu kien).
         tried: list[CollectJob] = []
@@ -425,14 +517,8 @@ class TaskSchedulerImpl:
             if not self.locks.acquire(f"account:{job.account_id}", owner=job.id):
                 tried.append(job)
                 continue
-            if proxy_id and not self.quota.acquire_proxy_slot(proxy_id):
+            if not self.quota.try_acquire(account_id=job.account_id, platform=platform, proxy_id=proxy_id):
                 self.locks.release(f"account:{job.account_id}", owner=job.id)
-                tried.append(job)
-                continue
-            if not self.quota.allow(account_id=job.account_id, platform=platform, proxy_id=proxy_id):
-                self.locks.release(f"account:{job.account_id}", owner=job.id)
-                if proxy_id:
-                    self.quota.release_proxy_slot(proxy_id)
                 tried.append(job)
                 continue
             job.status = JobStatus.RUNNING
