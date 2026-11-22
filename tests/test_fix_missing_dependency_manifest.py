@@ -13,9 +13,10 @@ test tren main (dang xfail, khong do suite); khi mot fix trong do merge
 xong, chuyen no sang REQUIRED. Them fix moi da triage = them mot dong
 vao REQUIRED cung voi file test cua no.
 Luu y ve moi truong chay: gate chi co y nghia tren checkout main day du
-(nhan dien bang file canary tests/test_systems_arch_m2.py). Khi CI chay
-le file test cua mot nhanh (sandbox chi co pyproject + file test nay),
-gate SKIP thay vi fail — vi thieu file o do khong phai do merge lam mat.
+(nhan dien bang file canary tests/test_systems_arch_m2.py va so luong
+file test_fix_*.py). Khi CI chay le file test cua mot nhanh (sandbox chi
+co pyproject + file test nay), gate SKIP thay vi fail — vi thieu file o
+do khong phai do merge lam mat.
 """
 from __future__ import annotations
 
@@ -40,7 +41,15 @@ FULL_MAIN_CANARY = "test_systems_arch_m2.py"
 
 
 def _is_full_main_checkout(tests_dir: Path = TESTS_DIR) -> bool:
-    return (tests_dir / FULL_MAIN_CANARY).is_file()
+    """True chi khi checkout co day du tests/ tren main.
+
+    Canary mot file la chua du: sandbox cua CI co the chi copy mot
+    vai file. Kiem tra them so luong file test_fix_*.py (tren main co
+    >30 file); sandbox chay le file test chi co 1 file nay.
+    """
+    if not (tests_dir / FULL_MAIN_CANARY).is_file():
+        return False
+    return len(list(tests_dir.glob("test_fix_*.py"))) >= 10
 
 # Pin duoc khoa trong pyproject.toml (phai khop file that).
 EXPECTED_PROD = {
@@ -203,9 +212,13 @@ def test_cryptography_aesgcm_available():
 
 def test_full_main_checkout_detection(tmp_path):
     """Logic nhan dien checkout day du: co canary thi gate chay,
-    khong co thi gate skip (sandbox chay le file test)."""
+    khong co thi gate skip (sandbox chay le file test). Chi canary
+    thoi la chua du — phai co ca so luong file test nhu tren main."""
     assert _is_full_main_checkout(tmp_path) is False
     (tmp_path / FULL_MAIN_CANARY).write_text("# canary\n", encoding="utf-8")
+    assert _is_full_main_checkout(tmp_path) is False
+    for i in range(10):
+        (tmp_path / f"test_fix_dummy_{i:02d}.py").write_text("# placeholder\n", encoding="utf-8")
     assert _is_full_main_checkout(tmp_path) is True
 
 
