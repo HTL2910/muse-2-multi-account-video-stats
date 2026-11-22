@@ -45,6 +45,11 @@ fix_browser_profile_geo_always_us x2 + fix_profile_close_loses_runtime):
   PENDING/IN_PROGRESS/DONE/FAILED, dem attempts va retry: fail duoi
   nguong thi quay lai PENDING, qua max_attempts thi FAILED; enqueue
   trung (account, kind) dang cho thi tra ve muc cu, khong nhan doi.
+- Ket thuc tien trinh trong close() qua _terminate_process da nen
+  tang: POSIX dung killpg nhu cu; Windows khong co os.killpg/
+  os.getpgid (ban dau goi thang gay AttributeError tren may chay
+  test Windows) nen dung taskkill /T /F, du phong os.kill, va moi
+  loi ket thuc deu duoc nuot de close() khong bao gio crash vi pid cu.
 """
 from __future__ import annotations
 
@@ -288,6 +293,43 @@ class SQLiteManualQueue:
             return status
 
 
+def _terminate_process(pid: int) -> None:
+    """Ket thuc tien trinh browser + cay tien trinh con, da nen tang.
+
+    POSIX: killpg(SIGTERM) de don ca cay Chromium. Windows khong co
+    os.killpg/os.getpgid (goi thang se AttributeError) nen dung
+    taskkill /T /F, du phong os.kill. Moi loi (tien trinh da chet,
+    khong co quyen...) deu duoc nuot — close() khong duoc phep crash
+    vi mot pid cu.
+    """
+    if not pid or pid <= 0:
+        return
+    if os.name == "nt":  # Windows
+        try:
+            import subprocess
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True, timeout=10)
+            return
+        except Exception:
+            pass
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        return
+    killpg = getattr(os, "killpg", None)
+    if killpg is not None:
+        try:
+            killpg(os.getpgid(pid), signal.SIGTERM)
+            return
+        except (ProcessLookupError, PermissionError, OSError, AttributeError):
+            pass
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+
 @dataclass
 class _Runtime:
     pid: Optional[int] = None
@@ -474,13 +516,7 @@ class IsolatedBrowserProfileManager:
             if prof is not None:
                 self._by_account.pop(prof.account_id, None)
         if rt and rt.pid:
-            try:
-                os.killpg(os.getpgid(rt.pid), signal.SIGTERM)
-            except (ProcessLookupError, PermissionError, OSError):
-                try:
-                    os.kill(rt.pid, signal.SIGTERM)
-                except OSError:
-                    pass
+            _terminate_process(rt.pid)
         if rt:
             for d in rt.temp_dirs:
                 shutil.rmtree(d, ignore_errors=True)
