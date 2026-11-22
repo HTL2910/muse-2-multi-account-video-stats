@@ -35,13 +35,26 @@ from src.observability.monitor import (
     unwrap_fixture_items,
 )
 
+# Fixture THUC tren main: data/golden/tiktok/video_list.json — 1 video,
+# stats long trong "stats" (shape API TikTok that), khong phai flat.
 TIKTOK_FIXTURE = {
     "data": {
         "videos": [
-            {"id": "tt-1", "views": 100, "likes": 5, "comments": 2, "shares": 1},
-            {"id": "tt-2", "views": 200, "likes": 9, "comments": 3, "shares": 2},
+            {
+                "id": "7512345678901234567",
+                "title": "Meo tam su dem khuya",
+                "desc": "meo tam su dem khuya",
+                "cover_image_url": "https://example.com/cover.jpg",
+                "create_time": 1763700000,
+                "duration": 32,
+                "share_url": "https://www.tiktok.com/@test/video/7512345678901234567",
+                "stats": {
+                    "play_count": 1000, "digg_count": 120, "comment_count": 15,
+                    "share_count": 8, "collect_count": 20,
+                },
+            }
         ],
-        "cursor": "abc",
+        "cursor": "",
         "has_more": False,
     }
 }
@@ -52,19 +65,22 @@ def _load_json(path: str):
 
 
 def _map_tiktok(platform, raw):
+    stats = raw["stats"]
     return UnifiedVideoMetric(
         video_id=f"vid-{raw['id']}", account_id="acc-1", platform=platform,
-        platform_video_id=raw["id"], views=raw["views"], likes=raw["likes"],
-        comments=raw["comments"], shares=raw["shares"],
+        platform_video_id=raw["id"], views=stats["play_count"],
+        likes=stats["digg_count"], comments=stats["comment_count"],
+        shares=stats["share_count"], saves=stats["collect_count"],
         date_bucket="2026-11-22",
     )
 
 
 def _expected_first() -> UnifiedVideoMetric:
     return UnifiedVideoMetric(
-        video_id="vid-tt-1", account_id="acc-1", platform=Platform.TIKTOK,
-        platform_video_id="tt-1", views=100, likes=5, comments=2, shares=1,
-        date_bucket="2026-11-22",
+        video_id="vid-7512345678901234567", account_id="acc-1",
+        platform=Platform.TIKTOK,
+        platform_video_id="7512345678901234567", views=1000, likes=120,
+        comments=15, shares=8, saves=20, date_bucket="2026-11-22",
     )
 
 
@@ -86,16 +102,16 @@ def test_golden_runner_with_real_tiktok_fixture_shape(tmp_path):
     ok, errors = runner.run(GoldenCase(
         id="golden-tiktok-1", name="tiktok video list",
         platform=Platform.TIKTOK, raw_fixture_path=str(fixture),
-        expected_video_count=2, expected_metric=_expected_first(),
+        expected_video_count=1, expected_metric=_expected_first(),
     ))
     assert ok, errors
     # Count sai phai fail, khong phai KeyError gia vo mapping.
     ok2, errors2 = runner.run(GoldenCase(
         id="golden-tiktok-1", name="tiktok video list",
         platform=Platform.TIKTOK, raw_fixture_path=str(fixture),
-        expected_video_count=3, expected_metric=_expected_first(),
+        expected_video_count=2, expected_metric=_expected_first(),
     ))
-    assert not ok2 and any("video count 2 != expected 3" in e for e in errors2)
+    assert not ok2 and any("video count 1 != expected 2" in e for e in errors2)
 
 
 def test_golden_runner_with_repo_tiktok_fixture_if_present():
@@ -106,6 +122,16 @@ def test_golden_runner_with_repo_tiktok_fixture_if_present():
     items = unwrap_fixture_items(raw)
     assert isinstance(items, list) and len(items) > 0
     assert all(isinstance(v, dict) and v.get("id") for v in items)
+    # Shape that cua fixture tren main: stats long trong "stats".
+    assert items[0]["stats"]["play_count"] == 1000
+    ok, errors = GoldenRunner(load_fixture=_load_json, adapter_map=_map_tiktok).run(
+        GoldenCase(
+            id="golden-tiktok-1", name="tiktok video list",
+            platform=Platform.TIKTOK, raw_fixture_path=str(path),
+            expected_video_count=1, expected_metric=_expected_first(),
+        )
+    )
+    assert ok, errors
 
 
 def test_kill_switch_default_threshold_is_not_0_9():
