@@ -1,0 +1,62 @@
+[
+  {
+    "id": "golden-facebook-001",
+    "platform": "facebook",
+    "name": "facebook video list basic",
+    "raw_fixture_path": "data/golden/facebook/video_list.json",
+    "expected_video_count": 1,
+    "expected_first_metric": {
+      "platform": "facebook",
+      "platform_video_id": "987",
+      "title": "T",
+      "views": 100,
+      "likes": 5,
+      "comments": 2,
+      "shares": 1,
+      "saves": 0,
+      "watch_time_seconds": 1234,
+      "source": "facebook_graph_api",
+      "quality": "ok"
+    }
+  },
+  {
+    "id": "golden-tiktok-001",
+    "platform": "tiktok",
+    "name": "tiktok video list basic",
+    "raw_fixture_path": "data/golden/tiktok/video_list.json",
+    "expected_video_count": 1,
+    "expected_first_metric": {
+      "platform": "tiktok",
+      "platform_video_id": "7512345678901234567",
+      "title": "Meo tam su dem khuya",
+      "views": 1000,
+      "likes": 120,
+      "comments": 15,
+      "shares": 8,
+      "saves": 20,
+      "watch_time_seconds": 0,
+      "source": "tiktok_api",
+      "quality": "ok"
+    }
+  },
+  {
+    "id": "golden-youtube-001",
+    "platform": "youtube",
+    "name": "youtube video list basic",
+    "raw_fixture_path": "data/golden/youtube/video_list.json",
+    "expected_video_count": 1,
+    "expected_first_metric": {
+      "platform": "youtube",
+      "platform_video_id": "yt_video_001",
+      "title": "Sample YT Video",
+      "views": 98000,
+      "likes": 6100,
+      "comments": 540,
+      "shares": 0,
+      "saves": 0,
+      "watch_time_seconds": 0,
+      "source": "youtube_data_api",
+      "quality": "ok"
+    }
+  }
+]
