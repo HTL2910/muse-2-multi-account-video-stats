@@ -84,12 +84,14 @@ def test_golden_runner_with_real_tiktok_fixture_shape(tmp_path):
     fixture.write_text(json.dumps(TIKTOK_FIXTURE), encoding="utf-8")
     runner = GoldenRunner(load_fixture=_load_json, adapter_map=_map_tiktok)
     ok, errors = runner.run(GoldenCase(
+        id="golden-tiktok-1", name="tiktok video list",
         platform=Platform.TIKTOK, raw_fixture_path=str(fixture),
         expected_video_count=2, expected_metric=_expected_first(),
     ))
     assert ok, errors
     # Count sai phai fail, khong phai KeyError gia vo mapping.
     ok2, errors2 = runner.run(GoldenCase(
+        id="golden-tiktok-1", name="tiktok video list",
         platform=Platform.TIKTOK, raw_fixture_path=str(fixture),
         expected_video_count=3, expected_metric=_expected_first(),
     ))
