@@ -8,6 +8,13 @@ Stdlib only in this reference impl.:
 - TOTP: RFC 6238 (HMAC-SHA1, 30s step, +/-1 window), mandatory for ADMIN.
 - Audit: append-only list/DB table + SHA-256 hash-chain; verify_chain()
   detects any edit/deletion. Secrets are NEVER written to detail (redacted).
+  The chain is TAMPER-EVIDENT, not tamper-proof: it detects edits made by
+  anyone who bypasses this API, it does not physically prevent them.
+  Thread-safety: AuditChain serializes appends with a lock (production:
+  one DB transaction + advisory lock per workspace) and never hands out
+  references to its stored entries — append()/entries() return deep
+  copies. At the PostgreSQL layer, append-only is enforced by the
+  trigger in AUDIT_APPEND_ONLY_SQL (no UPDATE/DELETE on the audit table).
 - Sessions: opaque token, idle+absolute timeout, revocable. Brute-force:
   per-account+IP token bucket with lockout. Security headers / CORS / CSRF
   helpers are framework-agnostic dicts for the API gateway (approach_13).
@@ -15,11 +22,13 @@ Stdlib only in this reference impl.:
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import hmac
 import json
 import secrets
 import struct
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -32,6 +41,7 @@ from src.contracts import AuditLogEntry, Role, utcnow
 __all__ = ["Permission", "ROLE_PERMISSIONS", "has_permission", "require_permission",
            "PermissionDenied", "hash_password", "verify_password", "generate_totp_secret",
            "verify_totp", "AuditChain", "redact_detail", "SENSITIVE_ACTIONS",
+           "AUDIT_APPEND_ONLY_SQL",
            "SessionManager", "OperatorSession", "LoginRateLimiter",
            "security_headers", "csrf_token_for", "check_csrf"]
 
@@ -154,31 +164,72 @@ def _entry_hash(entry: AuditLogEntry) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+# Production enforcement of append-only at the PostgreSQL layer (the
+# in-process chain below is tamper-EVIDENT; this trigger makes the stored
+# table tamper-RESISTANT for anyone going through SQL). Apply once when
+# provisioning the audit table; inserts stay allowed, updates/deletes
+# raise. Per-workspace serialization in production: wrap the INSERT in a
+# transaction that first takes pg_advisory_xact_lock(hashtext(workspace_id))
+# and reads MAX(created_at)/last entry_hash inside that same transaction.
+AUDIT_APPEND_ONLY_SQL = """
+CREATE OR REPLACE FUNCTION audit_log_forbid_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_log is append-only: % is forbidden', TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS audit_log_append_only ON audit_log;
+CREATE TRIGGER audit_log_append_only
+    BEFORE UPDATE OR DELETE ON audit_log
+    FOR EACH ROW EXECUTE FUNCTION audit_log_forbid_mutation();
+"""
+
+
 class AuditChain:
-    """Append-only audit log. No update/delete API exists by design."""
+    """Append-only, TAMPER-EVIDENT audit log (hash-chain).
+
+    Guarantees provided by THIS class:
+    - appends are serialized with a lock, so concurrent writers can never
+      fork the chain (two entries sharing one prev_hash);
+    - no update/delete API exists, and no method hands out a reference to
+      a stored entry: append() and entries() return deep copies, so
+      callers cannot mutate history through a returned object;
+    - verify_chain() detects any edit/deletion performed by bypassing
+      this API (direct memory or DB access) — detection, not prevention.
+    Prevention at rest is the database's job: see AUDIT_APPEND_ONLY_SQL.
+    """
 
     def __init__(self) -> None:
         self._entries: list[AuditLogEntry] = []
+        self._lock = threading.Lock()
 
     def append(self, *, workspace_id: str, actor_id: str, action: str,
                target_type: str, target_id: str,
                detail: Optional[dict[str, Any]] = None) -> AuditLogEntry:
-        entry = AuditLogEntry(
-            id=uuid.uuid4().hex, workspace_id=workspace_id, actor_id=actor_id,
-            action=action, target_type=target_type, target_id=target_id,
-            detail=redact_detail(detail or {}),
-            prev_hash=self._entries[-1].entry_hash if self._entries else "GENESIS")
-        entry.entry_hash = _entry_hash(entry)
-        self._entries.append(entry)
-        return entry
+        # The read of prev_hash, the hash computation and the append are
+        # ONE critical section: without the lock, two concurrent writers
+        # could both read the same last entry and fork the chain.
+        with self._lock:
+            entry = AuditLogEntry(
+                id=uuid.uuid4().hex, workspace_id=workspace_id, actor_id=actor_id,
+                action=action, target_type=target_type, target_id=target_id,
+                detail=redact_detail(detail or {}),
+                prev_hash=self._entries[-1].entry_hash if self._entries else "GENESIS")
+            entry.entry_hash = _entry_hash(entry)
+            self._entries.append(entry)
+            return copy.deepcopy(entry)
 
     def entries(self, *, workspace_id: Optional[str] = None) -> list[AuditLogEntry]:
-        return [e for e in self._entries
-                if workspace_id is None or e.workspace_id == workspace_id]
+        """Deep copies of the stored entries — mutating them changes nothing."""
+        with self._lock:
+            return [copy.deepcopy(e) for e in self._entries
+                    if workspace_id is None or e.workspace_id == workspace_id]
 
     def verify_chain(self) -> bool:
+        with self._lock:
+            snapshot = list(self._entries)
         prev = "GENESIS"
-        for e in self._entries:
+        for e in snapshot:
             if e.prev_hash != prev or e.entry_hash != _entry_hash(e):
                 return False
             prev = e.entry_hash
