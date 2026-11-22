@@ -29,9 +29,14 @@ from src.contracts import AccountStatus, Platform, PlatformAccount, TokenSet, ut
 
 
 def _account() -> PlatformAccount:
+    # guard() that trong PlatformAdapterBase (src/core/models.py) fail-closed:
+    # account khong co credential_ref -> AdapterAuthError. Day la con tro
+    # toi Vault, khong phai secret. Bo qua truong nay la loi cua fixture
+    # test (10 failed o CI truoc), khong phai loi cua authenticate().
     return PlatformAccount(
         id="acc-1", workspace_id="ws-1", platform=Platform.FACEBOOK,
         platform_user_id="page-1", status=AccountStatus.ACTIVE,
+        credential_ref="vault://facebook/acc-1",
     )
 
 
@@ -132,6 +137,20 @@ def test_empty_thumbnail_does_not_kill_batch():
     assert videos[1].thumbnail_url == ""
     assert videos[2].thumbnail_url == ""
     assert videos[3].thumbnail_url == "https://cdn.example/d.jpg"
+
+
+def test_authenticate_still_fail_closed_without_credential_ref():
+    """Hoi quy: sua fixture khong duoc lam mat guard — account khong co
+    credential_ref van phai bi AdapterAuthError, khong phai token gia."""
+    from src.core.models import AdapterAuthError
+
+    bare = PlatformAccount(
+        id="acc-1", workspace_id="ws-1", platform=Platform.FACEBOOK,
+        platform_user_id="page-1", status=AccountStatus.ACTIVE,
+    )
+    assert not bare.credential_ref
+    with pytest.raises(AdapterAuthError):
+        _connector(_fake_exchange(3600)).authenticate(bare)
 
 
 def test_refresh_token_uses_new_authenticate_when_needs_refresh():
