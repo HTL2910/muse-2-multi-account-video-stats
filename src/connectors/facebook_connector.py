@@ -24,7 +24,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
 try:
@@ -61,6 +61,11 @@ VIDEO_FIELDS = (
     "views,likes.summary(true),comments.summary(true),shares"
 )
 
+# fb_exchange_token tra expires_in (giay) cua token dai han, thuong la
+# 60 ngay (5184000s). Chi dung lam mac dinh khi API khong tra expires_in
+# hop le — khong bao gio dung utcnow() lam expires_at.
+DEFAULT_TOKEN_TTL_SECONDS = 60 * 24 * 3600
+
 
 class FacebookApiError(RuntimeError):
     def __init__(self, message: str, *, status: Optional[int] = None,
@@ -95,6 +100,24 @@ def _parse_dt(value: Any) -> Optional[datetime]:
         return None
 
 
+def _thumbnail_url(raw: dict[str, Any]) -> str:
+    """Lay thumbnail an toan: thumbnails.data=[] / thieu / sai kieu -> ''.
+
+    Ban cu dung ``.get("data", [{}])[0]`` nen crash IndexError khi
+    data=[] (mac dinh [{}] chi cuu khi thieu khoa), lam chet ca batch.
+    """
+    thumbnails = raw.get("thumbnails")
+    if not isinstance(thumbnails, dict):
+        return ""
+    data = thumbnails.get("data") or []
+    if not isinstance(data, list) or not data:
+        return ""
+    first = data[0]
+    if not isinstance(first, dict):
+        return ""
+    return str(first.get("uri") or "")
+
+
 def parse_facebook_video(raw: dict[str, Any], *, account: PlatformAccount,
                          video_id_map: Optional[dict[str, str]] = None) -> Video:
     """Map video goc Graph API -> Video chuan. ``video_id_map``: platform_video_id -> UUID noi bo."""
@@ -105,7 +128,7 @@ def parse_facebook_video(raw: dict[str, Any], *, account: PlatformAccount,
         platform_video_id=pid, title=str(raw.get("title") or raw.get("description") or ""),
         description=str(raw.get("description") or ""),
         url=str(raw.get("permalink_url") or f"https://www.facebook.com/watch/?v={pid}"),
-        thumbnail_url=str((raw.get("thumbnails") or {}).get("data", [{}])[0].get("uri", "")) if isinstance(raw.get("thumbnails"), dict) else "",
+        thumbnail_url=_thumbnail_url(raw),
         duration_seconds=_to_int(raw.get("length")) or None,
         published_at=_parse_dt(raw.get("created_time")),
         status=VideoStatus.ACTIVE,
@@ -229,8 +252,14 @@ class FacebookConnector(PlatformAdapterBase):
         data = resp.raw if isinstance(resp.raw, dict) else {}
         # _call tra raw body; neu la dict co access_token thi dung, neu khong giu token cu.
         new_token = data.get("access_token") or tokens.access_token
+        # Lay expires_in that tu API; khong co / khong hop le thi mac dinh
+        # +60 ngay (token dai han cua Facebook) va ghi ro — khong bao gio
+        # dung utcnow() lam expires_at (token vua doi da het han ngay).
+        expires_in = _to_int(data.get("expires_in"))
+        if expires_in <= 0:
+            expires_in = DEFAULT_TOKEN_TTL_SECONDS
         return TokenSet(access_token=new_token, refresh_token=tokens.refresh_token,
-                        expires_at=utcnow().replace(microsecond=0))
+                        expires_at=utcnow() + timedelta(seconds=expires_in))
 
     def check_alive(self, account: PlatformAccount) -> bool:
         try:
