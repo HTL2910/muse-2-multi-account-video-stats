@@ -264,7 +264,7 @@ class PriorityQueue:
         if not self._heap:
             return None
         item = heapq.heappop(self._heap).job
-        self._seen.pop(item.job.idempotency_key, None)
+        self._seen.pop(item.idempotency_key, None)
         return item
 
     def __len__(self) -> int:
