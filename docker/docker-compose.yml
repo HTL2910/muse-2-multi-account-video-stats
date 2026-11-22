@@ -1,0 +1,150 @@
+# approach_20 — Deployment packaging, backup/restore, ToS compliance.
+#
+# One-command bring-up:  docker compose -f docker/docker-compose.yml up -d --build
+# Rules baked in:
+# - Workers are stateless & horizontally scalable (`--scale worker=N`); they
+#   hold NO local state — jobs, leases and locks live in Redis/Postgres.
+# - Graceful shutdown: stop_grace_period > job lease so in-flight jobs finish
+#   or their lease expires and another worker picks them up (no hung jobs).
+# - Secrets come from .env / Docker secrets ONLY; never baked into images.
+# - Vault keys are backed up SEPARATELY from DB backups (different volume,
+#   different bucket, different credentials) — see `backup` / `vault-backup`.
+# - ToS: official APIs first (connectors), no automated like/comment/follow
+#   actions exist in any service; rate limits are enforced by the scheduler.
+name: multi-account-video-stats
+
+x-common: &common
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  postgres:
+    <<: *common
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-stats}
+      POSTGRES_USER: ${POSTGRES_USER:-stats}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-stats}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    <<: *common
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    <<: *common
+    build: { context: .., dockerfile: docker/Dockerfile.api }
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-stats}@postgres:5432/${POSTGRES_DB:-stats}
+      REDIS_URL: redis://redis:6379/0
+      VAULT_MASTER_KEY_FILE: /run/secrets/vault_master_key
+      TOS_OFFICIAL_API_ONLY: "true"        # connectors must prefer official APIs
+      TOS_NO_AUTO_ENGAGEMENT: "true"       # no like/comment/follow automation
+    secrets: [vault_master_key]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports: ["${API_PORT:-8000}:8000"]
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  worker:
+    <<: *common
+    build: { context: .., dockerfile: docker/Dockerfile.worker }
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-stats}@postgres:5432/${POSTGRES_DB:-stats}
+      REDIS_URL: redis://redis:6379/0
+      VAULT_MASTER_KEY_FILE: /run/secrets/vault_master_key
+      JOB_LEASE_SECONDS: "300"             # lease + heartbeat; expiry = requeue
+      JOB_TIMEOUT_SECONDS: "240"           # hard kill below lease, no hung jobs
+      WORKER_CONCURRENCY: "${WORKER_CONCURRENCY:-4}"
+    secrets: [vault_master_key]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    stop_grace_period: 60s               # drain in-flight job before SIGKILL
+    deploy:
+      replicas: ${WORKER_REPLICAS:-2}    # stateless: scale with --scale / K8s HPA
+      resources:
+        limits: { memory: 1G, cpus: "1.0" }
+
+  scheduler:
+    <<: *common
+    build: { context: .., dockerfile: docker/Dockerfile.worker }
+    command: ["python", "-m", "src.scheduler.task_scheduler", "--beat"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://${POSTGRES_USER:-stats}@postgres:5432/${POSTGRES_DB:-stats}
+    depends_on:
+      redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    stop_grace_period: 30s
+    # Exactly ONE scheduler replica — leader lock lives in Redis regardless.
+    deploy: { replicas: 1 }
+
+  frontend:
+    <<: *common
+    build: { context: .., dockerfile: docker/Dockerfile.frontend }
+    environment:
+      NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://localhost:8000}
+    depends_on: [api]
+    ports: ["${WEB_PORT:-3000}:3000"]
+    stop_grace_period: 15s
+
+  # --- Backup: DB and vault keys are SEPARATE jobs, targets and credentials.
+  backup:                                # database only — contains NO vault keys
+    image: postgres:16-alpine
+    environment:
+      PGPASSWORD_FILE: /run/secrets/postgres_password
+      BACKUP_RETENTION_DAYS: "${BACKUP_RETENTION_DAYS:-14}"
+    secrets: [postgres_password]
+    volumes:
+      - db_backups:/backups
+    entrypoint: ["sh", "-c", "while true; do pg_dump -h postgres -U $${POSTGRES_USER:-stats} $${POSTGRES_DB:-stats} | gzip > /backups/db-$$(date +%F-%H%M).sql.gz; find /backups -mtime +$${BACKUP_RETENTION_DAYS:-14} -delete; sleep 86400; done"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  vault-backup:                          # keys only — different volume/bucket
+    image: alpine:3.20
+    environment:
+      VAULT_BACKUP_PASSPHRASE_FILE: /run/secrets/vault_backup_passphrase
+    secrets: [vault_master_key, vault_backup_passphrase]
+    volumes:
+      - vault_key_backups:/backups
+    entrypoint: ["sh", "-c", "while true; do tar czf - -C /run/secrets vault_master_key | openssl enc -aes-256-cbc -salt -pbkdf2 -pass file:/run/secrets/vault_backup_passphrase > /backups/vault-keys-$$(date +%F-%H%M).tar.gz.enc; sleep 604800; done"]
+    # Restore drill (monthly, in staging): restore DB backup + vault backup
+    # into an empty stack, run `pytest tests/ -k golden`, verify one account
+    # can decrypt its credential_ref. A backup that was never restored is
+    # not a backup. See docs/RUNBOOK.md (approach_20 notes in this file).
+
+volumes:
+  postgres_data:
+  redis_data:
+  db_backups:
+  vault_key_backups:   # ship off-site separately from db_backups
+
+secrets:
+  postgres_password: { file: ../.secrets/postgres_password.txt }
+  vault_master_key: { file: ../.secrets/vault_master_key.txt }
+  vault_backup_passphrase: { file: ../.secrets/vault_backup_passphrase.txt }
