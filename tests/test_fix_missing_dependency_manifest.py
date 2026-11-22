@@ -13,10 +13,11 @@ test tren main (dang xfail, khong do suite); khi mot fix trong do merge
 xong, chuyen no sang REQUIRED. Them fix moi da triage = them mot dong
 vao REQUIRED cung voi file test cua no.
 Luu y ve moi truong chay: gate chi co y nghia tren checkout main day du
-(nhan dien bang file canary tests/test_systems_arch_m2.py va so luong
-file test_fix_*.py). Khi CI chay le file test cua mot nhanh (sandbox chi
-co pyproject + file test nay), gate SKIP thay vi fail — vi thieu file o
-do khong phai do merge lam mat.
+(nhan dien bang file canary tests/test_systems_arch_m2.py). Khi CI chay
+le file test cua mot nhanh (sandbox chi co pyproject + file test nay),
+gate SKIP thay vi fail — vi thieu file o do khong phai do merge lam mat.
+
+Chi dung stdlib + pytest; khong import bat ky module src nao.
 """
 from __future__ import annotations
 
@@ -69,6 +70,7 @@ TRIAGED_FIXES_REQUIRED = {
     "fix_api_import_delete_assign_audit": "test_fix_api_import_delete_assign_audit.py",
     "fix_audit_chain_thread_safety": "test_fix_audit_chain_thread_safety.py",
     "fix_browser_profile_missing": "test_fix_browser_profile_missing.py",
+    "fix_contracts_version_stale_portability": "test_fix_contracts_version_stale_portability.py",
     "fix_contracts_version_stale_tests": "test_fix_contracts_version_stale_tests.py",
     "fix_docker_compose_companions": "test_fix_docker_compose_companions.py",
     "fix_docker_compose_unrunnable": "test_fix_docker_compose_unrunnable.py",
