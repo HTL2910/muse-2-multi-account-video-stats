@@ -46,6 +46,27 @@
 # - backup: pg_dump khong doc password tu bien moi truong dang *_FILE
 #   (chi docker entrypoint cua image postgres moi doc); lay password tu
 #   /run/secrets vao PGPASSWORD ngay trong entrypoint.
+#
+# Fix (fix_scheduler_compose_no_account_source):
+# - Truoc fix nay service scheduler khong he co nguon account: entrypoint
+#   chi doc account tu file JSON qua env SCHEDULER_ACCOUNTS_FILE, nhung
+#   compose khong set env do va khong mount file nao — moi tick la no-op
+#   im lang du DATABASE_URL/REDIS_URL da co mat (hai env do entrypoint
+#   KHONG dung de doc account). Stack "healthy" nhung khong bao gio lap
+#   lich duoc job nao.
+# - Bay gio: volume dung chung `scheduler_accounts` duoc mount vao CA
+#   api (ben so huu account, ghi file) va scheduler (ben doc), va
+#   scheduler nhan SCHEDULER_ACCOUNTS_FILE=/run/accounts/accounts.json.
+#   Scheduler doi api healthy moi start de file kip ton tai o lan nap
+#   dau. Entrypoint nap file MOT LAN luc khoi dong: sau khi api cap
+#   nhat account, chay `docker compose restart scheduler` de nap lai.
+# - Gioi han con lai (khong nam trong pham vi compose): kenh file nay la
+#   cau noi o tang stack; trang thai dich da khoa la entrypoint doc
+#   account truc tiep tu store dung chung (Postgres qua DATABASE_URL —
+#   env da cap san cho service) o MOI tick, con file JSON chi la che do
+#   dev. Phan do thuoc src/scheduler/__main__.py + viec api luu account
+#   xuong store dung chung, duoc theo doi rieng — xem
+#   tests/test_fix_scheduler_compose_no_account_source.py.
 name: multi-account-video-stats
 
 x-common: &common
@@ -93,6 +114,11 @@ services:
       TOS_OFFICIAL_API_ONLY: "true"        # connectors must prefer official APIs
       TOS_NO_AUTO_ENGAGEMENT: "true"       # no like/comment/follow automation
     secrets: [vault_master_key]
+    # Kênh account dùng chung với scheduler (fix_scheduler_compose_no_
+    # account_source): api là bên sở hữu account và ghi accounts.json
+    # vào đây; scheduler đọc cùng file qua SCHEDULER_ACCOUNTS_FILE.
+    volumes:
+      - scheduler_accounts:/run/accounts
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -138,9 +164,19 @@ services:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql://${POSTGRES_USER:-stats}@postgres:5432/${POSTGRES_DB:-stats}
       SCHEDULER_INTERVAL_SECONDS: "${SCHEDULER_INTERVAL_SECONDS:-60}"
+      # Nguon account (fix_scheduler_compose_no_account_source): file
+      # tren volume dung chung voi api. Thieu dong nay (trang thai
+      # truoc fix) thi entrypoint khong co account nao va moi tick la
+      # no-op im lang.
+      SCHEDULER_ACCOUNTS_FILE: /run/accounts/accounts.json
+    volumes:
+      - scheduler_accounts:/run/accounts
     depends_on:
       redis: { condition: service_healthy }
       postgres: { condition: service_healthy }
+      # Doi api healthy de accounts.json kip duoc ghi truoc lan nap
+      # dau cua entrypoint (no chi nap file mot lan luc khoi dong).
+      api: { condition: service_healthy }
     stop_grace_period: 30s
     # Exactly ONE scheduler replica — leader lock lives in Redis regardless.
     deploy: { replicas: 1 }
@@ -184,6 +220,7 @@ volumes:
   redis_data:
   db_backups:
   vault_key_backups:   # ship off-site separately from db_backups
+  scheduler_accounts:  # shared api -> scheduler account channel (see header)
 
 secrets:
   # Tao truoc lan up dau tien: bash scripts/init_secrets.sh
