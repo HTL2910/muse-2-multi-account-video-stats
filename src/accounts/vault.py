@@ -40,6 +40,30 @@ fix_vault_wipe_noop_and_aead_fallback) — FAIL-CLOSED o khoi dong:
   interpreter, swap/hibernation cua OS) nam ngoai kha nang kiem soat
   — day la giam thieu ton du, KHONG phai cam ket xoa tuyet doi. KEK/
   DEK dai han phai nam o KMS/HSM o production.
+
+Fix ``fix_token_lock_distributed``: TokenManager truoc day chi dung
+threading.Lock trong _RefreshState — chi khoa duoc 1 process, nhieu
+worker refresh cung account dong thoi se dua nhau rotate
+refresh_token (ben thua mat session), va nhanh cho lock khong co
+timeout (acquire() chan vo han). Nay:
+- Khoa la khoa PHAN TAN that qua backend dung chung: giao dien
+  DistributedLock voi lease TTL, owner token ngau nhien, unlock chi
+  xoa khi owner khop (chong unlock nham khoa cua nguoi khac), va
+  acquire co timeout — het timeout la fail-closed, khong refresh.
+  Backend san co: RedisDistributedLock (Redis SET NX PX + Lua unlock,
+  production), PostgresAdvisoryLock (pg advisory lock giu theo
+  session), InMemoryDistributedLock (semantics giong Redis nhung nam
+  trong RAM — dung cho test va khi tat ca manager dung CHUNG mot
+  instance; mac dinh TokenManager dung mot instance dung chung cap
+  process, production nhieu process BAT BUOC inject backend
+  Redis/Postgres dung chung, neu khong khoa chi co tac dung trong
+  tung process).
+- Sau khi lay duoc khoa, TokenManager DOC LAI credential_ref/version
+  moi nhat tu store dung chung (latest_record) va chi refresh neu
+  version chua doi; neu worker khac da rotate xong thi dung ngay
+  token moi cua ho, khong goi refresher lan hai. Truoc khi rotate
+  cung kiem tra lai lan nua (lease co the het han giua chung) — neu
+  ref da doi thi huy rotate, dung ket qua cua ben thang.
 """
 from __future__ import annotations
 
@@ -80,6 +104,8 @@ __all__ = [
     "EncryptedRecord", "InMemoryVaultStore", "EncryptedSecretVault",
     "TokenManager", "mask_secret", "validate_cookie_blob",
     "ALG_AES_GCM", "ALG_DEV_FALLBACK", "dev_mode_enabled",
+    "DistributedLock", "InMemoryDistributedLock", "RedisDistributedLock",
+    "PostgresAdvisoryLock",
 ]
 
 _KINDS = {"password", "cookie", "access_token", "refresh_token",
@@ -307,6 +333,18 @@ class InMemoryVaultStore:
         with self._lock:
             self._r.pop(ref, None)
 
+    def find_latest(self, account_id: str, kind: str) -> Optional[EncryptedRecord]:
+        """Ban ghi version cao nhat cua (account_id, kind) trong store
+        dung chung — nguon su that de cac worker thay ref moi nhat sau
+        khi mot worker khac rotate."""
+        with self._lock:
+            best: Optional[EncryptedRecord] = None
+            for rec in self._r.values():
+                if rec.account_id == account_id and rec.kind == kind:
+                    if best is None or rec.version > best.version:
+                        best = rec
+            return best
+
 
 class EncryptedSecretVault:
     """Implements contracts.SecretVault.
@@ -361,7 +399,14 @@ class EncryptedSecretVault:
         finally:
             _wipe(dek)
         with self._lock:
-            ver = self._versions.get(f"{account_id}:{kind}", 0) + 1
+            # Version phai nhat quan giua cac vault instance dung CHUNG
+            # mot store: lay max(bien dem local, version cao nhat da co
+            # trong store) + 1, tranh hai instance cung danh so v{n}.
+            ver = self._versions.get(f"{account_id}:{kind}", 0)
+            latest = self.latest_record(account_id, kind)
+            if latest is not None:
+                ver = max(ver, latest.version)
+            ver += 1
             self._versions[f"{account_id}:{kind}"] = ver
         ref = f"vault://{account_id}/{kind}/v{ver}/{secrets.token_hex(6)}"
         self._store.put(EncryptedRecord(
@@ -399,6 +444,23 @@ class EncryptedSecretVault:
 
     def delete(self, *, credential_ref: str) -> None:
         self._store.remove(credential_ref)
+
+    # -- Shared-state reads (token refresh phan tan) -------------------
+    def record_for(self, credential_ref: str) -> Optional[EncryptedRecord]:
+        return self._store.get(credential_ref)
+
+    def latest_record(self, account_id: str, kind: str) -> Optional[EncryptedRecord]:
+        """Record moi nhat cua (account_id, kind) trong store dung
+        chung, hoac None neu store khong ho tro tra cuu (khi do caller
+        chi dua vao credential_ref cua minh — che do cu)."""
+        find = getattr(self._store, "find_latest", None)
+        if not callable(find):
+            return None
+        return find(account_id, kind)
+
+    def latest_ref(self, account_id: str, kind: str) -> Optional[str]:
+        rec = self.latest_record(account_id, kind)
+        return rec.credential_ref if rec is not None else None
 
     # -- TokenSet helpers ---------------------------------------------
     def store_token_set(self, *, account_id: str, tokens: TokenSet) -> str:
@@ -473,29 +535,205 @@ def validate_cookie_blob(raw: str) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------- Distributed lock
+class DistributedLock(Protocol):
+    """Khoa phan tan co lease: acquire tra owner token (None = timeout),
+    release chi xoa khoa khi owner khop, khoa tu het han theo TTL."""
+
+    def acquire(self, key: str, *, ttl_seconds: float,
+                timeout_seconds: float) -> Optional[str]: ...
+
+    def release(self, key: str, owner: str) -> bool: ...
+
+
+class InMemoryDistributedLock:
+    """Backend khoa trong RAM voi semantics cua Redis SET NX PX:
+    lease TTL, owner token, unlock compare-and-delete, acquire cho co
+    timeout. CHI khoa duoc cac ben dung CHUNG mot instance nay —
+    TokenManager mac dinh dung mot instance dung chung cap process;
+    nhieu process thi phai inject Redis/Postgres dung chung."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._locks: dict[str, tuple[str, float]] = {}  # key -> (owner, exp monotonic)
+
+    def acquire(self, key: str, *, ttl_seconds: float,
+                timeout_seconds: float) -> Optional[str]:
+        owner = secrets.token_hex(16)
+        deadline = time.monotonic() + max(timeout_seconds, 0.0)
+        with self._cond:
+            while True:
+                now = time.monotonic()
+                cur = self._locks.get(key)
+                if cur is None or cur[1] <= now:  # trong, hoac lease da het han
+                    self._locks[key] = (owner, now + ttl_seconds)
+                    return owner
+                remaining = deadline - now
+                if remaining <= 0:
+                    return None  # timeout: fail-closed o caller
+                self._cond.wait(timeout=min(remaining, max(cur[1] - now, 0.001), 0.25))
+
+    def release(self, key: str, owner: str) -> bool:
+        with self._cond:
+            cur = self._locks.get(key)
+            if cur is not None and cur[0] == owner:
+                del self._locks[key]
+                self._cond.notify_all()
+                return True
+            return False  # khong phai chu khoa: tuyet doi khong xoa
+
+    def extend(self, key: str, owner: str, *, ttl_seconds: float) -> bool:
+        with self._cond:
+            cur = self._locks.get(key)
+            if cur is not None and cur[0] == owner and cur[1] > time.monotonic():
+                self._locks[key] = (owner, time.monotonic() + ttl_seconds)
+                return True
+            return False
+
+
+class RedisDistributedLock:
+    """Khoa phan tan that tren Redis: SET key owner NX PX (lease),
+    unlock bang Lua compare-and-delete (chi chu khoa moi xoa duoc).
+    ``client`` la redis-py client (hoac tuong thich: set(nx=, px=), eval)."""
+
+    _UNLOCK_LUA = ("if redis.call('get', KEYS[1]) == ARGV[1] then "
+                   "return redis.call('del', KEYS[1]) else return 0 end")
+
+    def __init__(self, client, *, prefix: str = "lock:"):
+        self._client = client
+        self._prefix = prefix
+
+    def acquire(self, key: str, *, ttl_seconds: float,
+                timeout_seconds: float) -> Optional[str]:
+        owner = secrets.token_hex(16)
+        deadline = time.monotonic() + max(timeout_seconds, 0.0)
+        while True:
+            ok = self._client.set(self._prefix + key, owner, nx=True,
+                                  px=max(int(ttl_seconds * 1000), 1))
+            if ok:
+                return owner
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            time.sleep(min(0.05, remaining))
+
+    def release(self, key: str, owner: str) -> bool:
+        try:
+            return bool(self._client.eval(
+                self._UNLOCK_LUA, 1, self._prefix + key, owner))
+        except Exception:
+            return False  # lease se tu het han; khong xoa mu
+
+
+class PostgresAdvisoryLock:
+    """Khoa phan tan bang Postgres advisory lock (giao dien thay the
+    Redis): moi lan acquire giu mot connection rieng, lock song theo
+    session, release = pg_advisory_unlock + tra connection.
+    ``connection_factory`` tra ve psycopg connection (autocommit)."""
+
+    def __init__(self, connection_factory: Callable[[], object]):
+        self._factory = connection_factory
+        self._held: dict[str, object] = {}  # owner -> connection
+        self._guard = threading.Lock()
+
+    @staticmethod
+    def _lock_id(key: str) -> int:
+        raw = hashlib.sha256(key.encode()).digest()[:8]
+        return int.from_bytes(raw, "big", signed=True)
+
+    def _query_bool(self, conn, sql: str, lock_id: int) -> bool:
+        cur = conn.cursor()
+        try:
+            cur.execute(sql, (lock_id,))
+            row = cur.fetchone()
+            return bool(row and row[0])
+        finally:
+            cur.close()
+
+    def acquire(self, key: str, *, ttl_seconds: float,
+                timeout_seconds: float) -> Optional[str]:
+        # ttl_seconds khong ap dung: advisory lock song theo session,
+        # nhung acquire van co timeout nhu cac backend khac.
+        del ttl_seconds
+        owner = secrets.token_hex(16)
+        conn = self._factory()
+        deadline = time.monotonic() + max(timeout_seconds, 0.0)
+        try:
+            while True:
+                if self._query_bool(conn, "SELECT pg_try_advisory_lock(%s)",
+                                    self._lock_id(key)):
+                    with self._guard:
+                        self._held[owner] = conn
+                    return owner
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    conn.close()
+                    return None
+                time.sleep(min(0.05, remaining))
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+
+    def release(self, key: str, owner: str) -> bool:
+        with self._guard:
+            conn = self._held.pop(owner, None)
+        if conn is None:
+            return False  # khong phai chu khoa
+        try:
+            return self._query_bool(conn, "SELECT pg_advisory_unlock(%s)",
+                                    self._lock_id(key))
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+_DEFAULT_LOCK = InMemoryDistributedLock()
+
+
+def _default_lock_backend() -> InMemoryDistributedLock:
+    """Instance khoa dung chung cap process cho cac TokenManager
+    khong duoc inject backend rieng (van chi trong 1 process —
+    production nhieu process phai inject backend dung chung that)."""
+    return _DEFAULT_LOCK
+
+
 # ---------------------------------------------------------------- Token manager
 @dataclass
 class _RefreshState:
-    lock: threading.Lock = field(default_factory=threading.Lock)
     failures: int = 0
     last_error: str = ""
 
 
 class TokenManager:
-    """Refresh truoc han voi distributed lock theo account_id.
+    """Refresh truoc han voi KHOA PHAN TAN theo account_id.
 
-    ``lock_provider`` prod la Redis lock; mac dinh la lock in-process
-    keyed theo account_id (dung duoc cho 1 worker process, interface
-    giong het). ``refresher`` la ham cua adapter: TokenSet -> TokenSet,
-    raise TokenRevokedError neu bi thu hoi/checkpoint.
+    ``lock_provider`` la DistributedLock dung chung giua cac worker/
+    process (production: RedisDistributedLock hoac
+    PostgresAdvisoryLock); mac dinh la InMemoryDistributedLock dung
+    chung cap process. ``lock_ttl_seconds`` la lease cua khoa,
+    ``lock_timeout_seconds`` la thoi gian cho toi da de lay khoa —
+    het timeout thi fail-closed (khong refresh, khong rotate).
+    ``refresher`` la ham cua adapter: TokenSet -> TokenSet, raise
+    TokenRevokedError neu bi thu hoi/checkpoint.
     """
 
     def __init__(self, vault: EncryptedSecretVault,
                  refresher: Callable[[PlatformAccount, TokenSet], TokenSet],
                  *, max_failures: int = 3,
-                 before_minutes: int = TOKEN_REFRESH_BEFORE_MINUTES):
+                 before_minutes: int = TOKEN_REFRESH_BEFORE_MINUTES,
+                 lock_provider: Optional[DistributedLock] = None,
+                 lock_ttl_seconds: float = 60.0,
+                 lock_timeout_seconds: float = 10.0):
         self._vault, self._refresher = vault, refresher
         self._max_failures, self._before = max_failures, before_minutes
+        self._lock: DistributedLock = lock_provider or _default_lock_backend()
+        self._lock_ttl = float(lock_ttl_seconds)
+        self._lock_timeout = float(lock_timeout_seconds)
         self._states: dict[str, _RefreshState] = {}
         self._guard = threading.Lock()
 
@@ -503,27 +741,61 @@ class TokenManager:
         with self._guard:
             return self._states.setdefault(account_id, _RefreshState())
 
+    def _read_current(self, account: PlatformAccount) -> Optional[TokenSet]:
+        """Doc token set hien tai tu store dung chung. Neu
+        account.credential_ref da bi worker khac rotate mat (ref cu
+        khong con ton tai) thi tu dong nhay sang ref moi nhat cua
+        account trong store; khong tim thay gi thi tra None."""
+        try:
+            return self._vault.retrieve_token_set(
+                credential_ref=account.credential_ref)
+        except VaultError:
+            latest = self._vault.latest_ref(account.id, "token_set")
+            if latest and latest != account.credential_ref:
+                account.credential_ref = latest
+                return self._vault.retrieve_token_set(credential_ref=latest)
+            return None
+
     def ensure_fresh(self, account: PlatformAccount) -> tuple[TokenSet, AccountStatus]:
-        """Tra (tokens, status_moi). Fail-closed khi revoked/het luot."""
+        """Tra (tokens, status_moi). Fail-closed khi revoked/het luot/
+        khong lay duoc khoa phan tan trong timeout."""
         if not account.credential_ref:
             return TokenSet(), AccountStatus.NEEDS_REAUTH
-        tokens = self._vault.retrieve_token_set(
-            credential_ref=account.credential_ref)
+        tokens = self._read_current(account)
+        if tokens is None:
+            return TokenSet(), AccountStatus.NEEDS_REAUTH
         if not tokens.needs_refresh(before_minutes=self._before):
             return tokens, account.status
+        base_ref = account.credential_ref
+        rec = self._vault.record_for(base_ref)
+        base_version = rec.version if rec is not None else None
         st = self._state(account.id)
-        # Distributed lock: chi 1 worker refresh cho 1 account tai 1 thoi diem
-        if not st.lock.acquire(blocking=False):
-            # Worker khac dang refresh: dung token hien tai neu chua het han
-            if not tokens.is_expired():
-                return tokens, account.status
-            st.lock.acquire()  # cho refresh xong roi doc lai
-            try:
-                return (self._vault.retrieve_token_set(
-                    credential_ref=account.credential_ref), account.status)
-            finally:
-                st.lock.release()
+        key = f"token-refresh:{account.id}"
+        owner = self._lock.acquire(key, ttl_seconds=self._lock_ttl,
+                                   timeout_seconds=self._lock_timeout)
+        if owner is None:
+            # Het timeout lay khoa: FAIL-CLOSED — khong refresh, khong
+            # rotate. Token con han thi tra lai kem TOKEN_EXPIRING de
+            # caller lui lai sau; token da het han thi NEEDS_REAUTH.
+            if tokens.is_expired():
+                return tokens, AccountStatus.NEEDS_REAUTH
+            return tokens, AccountStatus.TOKEN_EXPIRING
         try:
+            # DOC LAI tu store dung chung SAU khi co khoa: neu ref/
+            # version da doi thi worker khac da refresh xong — dung
+            # ket qua cua ho, TUYET DOI khong refresh lan hai (rotate
+            # refresh_token se lam ben thua mat session).
+            latest = self._vault.latest_record(account.id, "token_set")
+            if latest is not None and (
+                    latest.credential_ref != base_ref
+                    or (base_version is not None
+                        and latest.version != base_version)):
+                account.credential_ref = latest.credential_ref
+                fresh = self._vault.retrieve_token_set(
+                    credential_ref=latest.credential_ref)
+                if not fresh.needs_refresh(before_minutes=self._before):
+                    return fresh, AccountStatus.ACTIVE
+                tokens = fresh
             try:
                 new_tokens = self._refresher(account, tokens)
             except TokenRevokedError:
@@ -536,6 +808,15 @@ class TokenManager:
                 return tokens, AccountStatus.TOKEN_EXPIRING
             if not new_tokens.access_token:
                 return tokens, AccountStatus.NEEDS_REAUTH
+            # Kiem tra lan cuoi truoc khi rotate: lease co the da het
+            # han va mot worker khac co the da rotate trong luc ta
+            # dang refresh — neu ref da doi thi huy rotate cua minh.
+            winner = self._vault.latest_ref(account.id, "token_set")
+            if winner and winner != account.credential_ref:
+                account.credential_ref = winner
+                won = self._vault.retrieve_token_set(credential_ref=winner)
+                st.failures = 0
+                return won, AccountStatus.ACTIVE
             new_ref = self._vault.rotate(
                 credential_ref=account.credential_ref,
                 new_secret=json.dumps({
@@ -548,7 +829,7 @@ class TokenManager:
             st.failures = 0
             return new_tokens, AccountStatus.ACTIVE
         finally:
-            st.lock.release()
+            self._lock.release(key, owner)
 
     @staticmethod
     def expiry_within(tokens: TokenSet, *, hours: int = 24) -> bool:
