@@ -46,6 +46,17 @@ duoc chan job thuong da due phia sau), ``pop()`` bat buoc due,
 ``pop_due`` voi now snapshot mot lan moi lan goi; ``finish_job()``
 giu nguyen cach tinh ``scheduled_at`` retry (nay moi thuc su duoc
 ton trong). Fix quota / enqueue gate giu nguyen, khong thay doi.
+Fix ``fix_scheduler_enqueue_dedup_protocol`` (contracts 1.1.0): ``enqueue()``
+goi ``PriorityQueue.push()`` nhung bo qua gia tri tra ve — push tra
+False khi ``idempotency_key`` da co trong ``_seen`` (job khong vao
+heap) — roi van gan ``PENDING`` va tra job do ve, nen caller tuong
+job da xep hang trong khi job da bi loai lang le (mat job) va khong
+ai nhan duoc co dedup. Tu ban nay: push False thi tra job GOC (tra
+tu queue theo key) kem ``deduplicated=True`` /
+``duplicate_of=<id goc>``; push thanh cong thi giu hanh vi cu.
+``requeue_dead_letter`` cung bo qua gia tri tra ve cua push — cung
+dang mat job lang le neu key da co trong queue — chua sua o nhanh
+nay, de cho fix tiep theo (xem ghi chu o ham do).
 """
 from __future__ import annotations
 
@@ -221,6 +232,14 @@ class PriorityQueue:
         heapq.heappush(self._heap, _Queued((-int(job.priority), dl, self._seq), job))
         self._seen[job.idempotency_key] = job
         return True
+
+    def get_by_idempotency_key(self, key: str) -> Optional[CollectJob]:
+        """Job da xep hang co key nay (None neu chua co).
+
+        Dung cho ``enqueue()`` tra job goc khi bi dedup — khong cho
+        caller soi truc tiep ``_seen``.
+        """
+        return self._seen.get(key)
 
     def pop_due(self, now: Optional[datetime] = None) -> Optional[CollectJob]:
         """Lay job due tot nhat (uu tien cao nhat, roi deadline som nhat).
@@ -555,8 +574,23 @@ class TaskSchedulerImpl:
             job.last_error = reason
             return job
         # Queue rieng theo platform; job mac dinh PENDING.
+        # Dedup (contracts 1.1.0): push() tra False nghia la key da co
+        # trong queue — job moi KHONG vao heap. Tra job GOC kem co
+        # dedup thay vi tra job moi o trang thai PENDING gia (loi cu:
+        # caller tin job da xep hang trong khi job da bi loai lang le).
+        queue = self.queues[job.platform]
+        if not queue.push(job):
+            original = queue.get_by_idempotency_key(job.idempotency_key)
+            if original is not None:
+                original.deduplicated = True
+                original.duplicate_of = original.id
+                return original
+            # Khong the xay ra (push False ⟺ key da co trong _seen):
+            # phong thu — it nhat bao that job bi dedup chu khong tra
+            # PENDING gia.
+            job.deduplicated = True
+            return job
         job.status = JobStatus.PENDING
-        self.queues[job.platform].push(job)
         return job
 
     def requeue_dead_letter(self, job_id: str) -> CollectJob:
@@ -572,6 +606,11 @@ class TaskSchedulerImpl:
                     return job
                 job.attempts = 0
                 job.status = JobStatus.PENDING
+                # TODO(fix_scheduler_enqueue_dedup_protocol follow-up): push() o
+                # day cung bi bo qua gia tri tra ve — neu key da co
+                # trong queue thi job bi loai lang le y nhu loi enqueue
+                # cu. Chua sua o nhanh nay (ngoai pham vi da thong
+                # nhat); can tra job goc kem co dedup nhu enqueue().
                 self.queues[job.platform].push(job)
                 return job
         raise KeyError(f"job {job_id} not in dead-letter queue")
