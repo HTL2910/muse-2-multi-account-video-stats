@@ -18,6 +18,21 @@ inject ``auth_checker`` de bo qua. Rate-limit theo tenant (in-memory,
 production thay bang Redis). WebSocket broadcast su kien
 account_status_changed / sync_completed / alert.
 OpenAPI/Swagger tu dong tu FastAPI; SDK TypeScript sinh tu OpenAPI.
+
+Fix ``fix_api_import_delete_assign_audit`` (fix_api_import_delete_no_
+dedup_no_audit cua systems-arch):
+- Import accounts la UPSERT theo natural key (workspace_id, platform,
+  platform_user_id): import lap khong tao account trung; ban ghi da co
+  duoc cap nhat truong mo ta va tra ve o danh sach ``updated``.
+- Delete la SOFT-delete: account chuyen DISABLED va van o lai trong
+  store, credential_ref bi thu hoi (xoa khoi account), binding proxy
+  dang mo bi dong (unbound_at), va ghi 1 ban ghi audit append-only
+  (hash-chain) — khong con xoa cung khoi dict nhu truoc.
+- Assign-proxy: proxy phai thuoc workspace cua account (workspace cua
+  proxy duoc ghi nhan luc /proxies/import tu claims; account ngoai
+  workspace cua caller -> 403, proxy khac workspace -> 403), ghi
+  ProxyBinding moi, dong binding cu (unbound_at) va tuan thu sticky
+  1-1 (1 proxy dang bound cho account khac -> 409).
 """
 from __future__ import annotations
 
@@ -38,19 +53,20 @@ from pydantic import BaseModel, Field
 
 try:
     from src.contracts import (  # type: ignore
-        AccountStatus, JobPriority, JobStatus, JobType, Platform,
-        PlatformAccount, ProxyInfo, ProxyStatus, Video,
+        AccountStatus, AuditLogEntry, JobPriority, JobStatus, JobType, Platform,
+        PlatformAccount, ProxyBinding, ProxyInfo, ProxyStatus, Video,
         UnifiedVideoMetric, utcnow,
     )
 except ImportError:
     from ..contracts import (  # type: ignore
-        AccountStatus, JobPriority, JobStatus, JobType, Platform,
-        PlatformAccount, ProxyInfo, ProxyStatus, Video,
+        AccountStatus, AuditLogEntry, JobPriority, JobStatus, JobType, Platform,
+        PlatformAccount, ProxyBinding, ProxyInfo, ProxyStatus, Video,
         UnifiedVideoMetric, utcnow,
     )
 
 __all__ = ["create_app", "app", "EventHub", "InMemoryStore", "RateLimiter",
-           "encode_cursor", "decode_cursor", "paginate_keyset"]
+           "encode_cursor", "decode_cursor", "paginate_keyset",
+           "append_audit", "verify_audit_chain", "natural_key"]
 
 # --- Keyset cursor pagination (signed, khong dung offset) -------------------
 # Dinh dang cursor: "<payload_b64url>.<sig_b64url>" voi payload JSON
@@ -156,6 +172,47 @@ def paginate_keyset(items: list[Any], *, cursor: Optional[str], limit: int,
                    if len(decorated) > limit and page else None)
     return [d[2] for d in page], next_cursor, len(items)
 
+# --- Audit append-only (hash-chain, cung ngu nghia approach_16) -------------
+_AUDIT_SECRET_KEYS = ("password", "token", "cookie", "secret", "totp", "authorization")
+
+def _audit_entry_hash(entry: AuditLogEntry) -> str:
+    payload = json.dumps({
+        "prev": entry.prev_hash, "id": entry.id, "ws": entry.workspace_id,
+        "actor": entry.actor_id, "action": entry.action,
+        "target": f"{entry.target_type}:{entry.target_id}",
+        "detail": entry.detail, "ts": entry.created_at.isoformat(),
+    }, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+def append_audit(store: "InMemoryStore", *, workspace_id: str, actor_id: str,
+                 action: str, target_type: str, target_id: str,
+                 detail: Optional[dict[str, Any]] = None) -> AuditLogEntry:
+    """Ghi 1 ban ghi audit APPEND-ONLY: khong co duong sua/xoa ban ghi cu,
+    moi ban ghi chua hash cua ban ghi truoc (hash-chain) de phat hien
+    sua doi. Detail duoc redact cac khoa nhay cam truoc khi luu."""
+    safe_detail = {k: ("***" if any(s in k.lower() for s in _AUDIT_SECRET_KEYS) else v)
+                   for k, v in (detail or {}).items()}
+    entry = AuditLogEntry(
+        id=uuid.uuid4().hex, workspace_id=workspace_id, actor_id=actor_id,
+        action=action, target_type=target_type, target_id=target_id,
+        detail=safe_detail,
+        prev_hash=store.audit_log[-1].entry_hash if store.audit_log else "GENESIS")
+    entry.entry_hash = _audit_entry_hash(entry)
+    store.audit_log.append(entry)
+    return entry
+
+def verify_audit_chain(store: "InMemoryStore") -> bool:
+    prev = "GENESIS"
+    for e in store.audit_log:
+        if e.prev_hash != prev or e.entry_hash != _audit_entry_hash(e):
+            return False
+        prev = e.entry_hash
+    return True
+
+def natural_key(workspace_id: str, platform: Platform, platform_user_id: str) -> tuple[str, str, str]:
+    """Natural key cua account de import upsert/dedup."""
+    return (workspace_id, platform.value, platform_user_id)
+
 # --- Store bo nho (production: PostgreSQL + MetricsStore) -------------------
 @dataclass
 class InMemoryStore:
@@ -166,6 +223,38 @@ class InMemoryStore:
     groups: dict[str, dict[str, Any]] = field(default_factory=dict)
     jobs: dict[str, dict[str, Any]] = field(default_factory=dict)
     events: list[dict[str, Any]] = field(default_factory=list)
+    # fix_api_import_delete_assign_audit:
+    proxy_bindings: dict[str, ProxyBinding] = field(default_factory=dict)
+    proxy_workspaces: dict[str, str] = field(default_factory=dict)  # proxy_id -> workspace_id luc import
+    audit_log: list[AuditLogEntry] = field(default_factory=list)
+
+    @property
+    def bindings(self) -> dict[str, ProxyBinding]:
+        return self.proxy_bindings
+
+    @property
+    def audit(self) -> list[AuditLogEntry]:
+        return self.audit_log
+
+    def find_account(self, workspace_id: str, platform: Platform,
+                     platform_user_id: str) -> Optional[PlatformAccount]:
+        key = natural_key(workspace_id, platform, platform_user_id)
+        for a in self.accounts.values():
+            if natural_key(a.workspace_id, a.platform, a.platform_user_id) == key:
+                return a
+        return None
+
+    def active_binding_for_account(self, account_id: str) -> Optional[ProxyBinding]:
+        for b in self.proxy_bindings.values():
+            if b.account_id == account_id and b.unbound_at is None:
+                return b
+        return None
+
+    def active_binding_for_proxy(self, proxy_id: str) -> Optional[ProxyBinding]:
+        for b in self.proxy_bindings.values():
+            if b.proxy_id == proxy_id and b.unbound_at is None:
+                return b
+        return None
 
     def list_accounts(self, *, workspace_id: str, platform: Optional[Platform] = None,
                       status: Optional[AccountStatus] = None, search: str = "") -> list[PlatformAccount]:
@@ -285,11 +374,21 @@ def create_app(*, store: Optional[InMemoryStore] = None,
         if not limiter.allow(tenant):
             raise HTTPException(status_code=429, detail="rate limited for tenant")
 
+    def _actor(claims: dict[str, Any]) -> str:
+        return str(claims.get("sub") or claims.get("user_id") or claims.get("actor_id") or "")
+
+    def _close_binding(binding: Optional[ProxyBinding], *, reason: str) -> None:
+        if binding is not None and binding.unbound_at is None:
+            binding.unbound_at = utcnow()
+            binding.reason = reason
+
     app = FastAPI(title="multi-account-video-stats API", version="1.0.0")
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
     app.state.store = store
     app.state.hub = hub
     app.state.scheduler = scheduler
+    app.state.audit_log = store.audit_log
+    app.state.proxy_bindings = store.proxy_bindings
 
     def _page(items: list[Any], *, cursor: Optional[str], limit: int,
               key: Callable[[Any], tuple[Any, Any]]):
@@ -337,22 +436,82 @@ def create_app(*, store: Optional[InMemoryStore] = None,
 
     @app.delete("/accounts/{account_id}", status_code=204)
     def delete_account(account_id: str, claims: dict = Depends(_auth)):
-        if account_id not in store.accounts:
+        """SOFT-delete + cascade thu hoi, ghi audit append-only.
+
+        Khong xoa khoi dict: account -> DISABLED (van truy vet duoc),
+        credential_ref bi thu hoi (xoa khoi account; chi luu SHA-256 cua
+        ref trong audit, khong luu ref goc), binding proxy dang mo bi
+        dong voi unbound_at va account.proxy_binding_id duoc go.
+        Xoa lai account da DISABLED la idempotent (204, khong ghi them
+        audit trung).
+        """
+        a = store.accounts.get(account_id)
+        if not a:
             raise HTTPException(status_code=404, detail="account not found")
-        del store.accounts[account_id]
+        claims_ws = str(claims.get("workspace_id") or "")
+        if claims_ws and claims_ws != a.workspace_id:
+            raise HTTPException(status_code=403, detail="account belongs to another workspace")
+        if a.status == AccountStatus.DISABLED:
+            return None  # idempotent: da xoa mem truoc do
+        revoked_ref = a.credential_ref
+        binding = store.active_binding_for_account(a.id)
+        _close_binding(binding, reason="account_deleted")
+        a.proxy_binding_id = None
+        a.credential_ref = ""  # thu hoi credential: account khong con tham chieu Vault
+        a.status = AccountStatus.DISABLED
+        a.updated_at = utcnow()
+        append_audit(store, workspace_id=a.workspace_id, actor_id=_actor(claims),
+                     action="account.delete", target_type="account", target_id=a.id,
+                     detail={"platform": a.platform.value,
+                             "credential_revoked": bool(revoked_ref),
+                             "credential_ref_sha256": (hashlib.sha256(revoked_ref.encode()).hexdigest()
+                                                       if revoked_ref else ""),
+                             "proxy_binding_closed": binding.id if binding else ""})
         return None
 
     @app.post("/accounts/import", status_code=201)
     def import_accounts(body: list[AccountCreate], claims: dict = Depends(_auth)):
+        """Import UPSERT theo natural key (workspace, platform,
+        platform_user_id): import lap khong tao ban ghi trung — ban ghi
+        da co duoc cap nhat display_name/credential_ref/owner/niche/tags
+        (chi khi payload co gia tri) va tra ve trong ``updated``.
+        Trung ngay trong cung 1 payload cung chi tao 1 account.
+        Account da bi soft-delete (DISABLED) van duoc coi la da ton tai:
+        import lai khong tao ban sao va khong tu dong kich hoat lai."""
         _rate(claims)
-        created = []
+        created: list[str] = []
+        updated: list[str] = []
         for item in body:
+            existing = store.find_account(item.workspace_id, item.platform,
+                                          item.platform_user_id)
+            if existing is not None:
+                if item.display_name:
+                    existing.display_name = item.display_name
+                if item.credential_ref:
+                    existing.credential_ref = item.credential_ref
+                if item.owner:
+                    existing.owner = item.owner
+                if item.niche:
+                    existing.niche = item.niche
+                if item.tags:
+                    existing.tags = list(item.tags)
+                existing.updated_at = utcnow()
+                updated.append(existing.id)
+                continue
             a = PlatformAccount(id=uuid.uuid4().hex, workspace_id=item.workspace_id,
                                 platform=item.platform, platform_user_id=item.platform_user_id,
-                                display_name=item.display_name, credential_ref=item.credential_ref)
+                                display_name=item.display_name, credential_ref=item.credential_ref,
+                                owner=item.owner, niche=item.niche, tags=list(item.tags))
             store.accounts[a.id] = a
             created.append(a.id)
-        return {"created": created, "count": len(created)}
+        if created or updated:
+            append_audit(store,
+                         workspace_id=str(claims.get("workspace_id") or (body[0].workspace_id if body else "")),
+                         actor_id=_actor(claims), action="account.import",
+                         target_type="account", target_id="",
+                         detail={"created": len(created), "updated": len(updated)})
+        return {"created": created, "updated": updated,
+                "count": len(created), "total": len(created) + len(updated)}
 
     def _enqueue(account_id: str, job_type: JobType, claims: dict) -> SyncResponse:
         a = store.accounts.get(account_id)
@@ -383,14 +542,52 @@ def create_app(*, store: Optional[InMemoryStore] = None,
 
     @app.post("/accounts/{account_id}/assign-proxy")
     def assign_proxy(account_id: str, body: dict[str, Any], claims: dict = Depends(_auth)):
+        """Gan proxy sticky 1-1, co ghi ProxyBinding va audit.
+
+        - Account phai thuoc workspace cua caller (claims) -> lech 403.
+        - Proxy phai thuoc workspace cua account: workspace cua proxy
+          duoc ghi nhan tu claims luc /proxies/import (proxy chua ro
+          workspace — vd fixture nap thang vao store — duoc coi la
+          tai nguyen dung chung). Lech workspace -> 403.
+        - Proxy dang ACTIVE-bound cho account KHAC -> 409 (sticky 1-1).
+        - Gan lai dung proxy dang bound -> idempotent, tra binding cu.
+        - Doi proxy: binding cu bi dong (unbound_at, reason=reassigned),
+          binding moi duoc tao va account.proxy_binding_id tro toi
+          BINDING id (khong con tro thang proxy id nhu truoc).
+        """
         a = store.accounts.get(account_id)
+        if not a:
+            raise HTTPException(status_code=404, detail="account not found")
+        claims_ws = str(claims.get("workspace_id") or "")
+        if claims_ws and claims_ws != a.workspace_id:
+            raise HTTPException(status_code=403, detail="account belongs to another workspace")
+        if a.status == AccountStatus.DISABLED:
+            raise HTTPException(status_code=409, detail="account is DISABLED")
         proxy = store.proxies.get(str(body.get("proxy_id", "")))
-        if not a or not proxy:
-            raise HTTPException(status_code=404, detail="account or proxy not found")
+        if not proxy:
+            raise HTTPException(status_code=404, detail="proxy not found")
+        proxy_ws = store.proxy_workspaces.get(proxy.id) or str(getattr(proxy, "workspace_id", "") or "")
+        if proxy_ws and proxy_ws != a.workspace_id:
+            raise HTTPException(status_code=403, detail="proxy belongs to another workspace")
         if proxy.status != ProxyStatus.ACTIVE:
             raise HTTPException(status_code=409, detail=f"proxy not ACTIVE: {proxy.status.value}")
-        a.proxy_binding_id = proxy.id
-        return {"account_id": a.id, "proxy_id": proxy.id}
+        current = store.active_binding_for_account(a.id)
+        if current is not None and current.proxy_id == proxy.id:
+            return {"account_id": a.id, "proxy_id": proxy.id, "binding_id": current.id}
+        holder = store.active_binding_for_proxy(proxy.id)
+        if holder is not None and holder.account_id != a.id:
+            raise HTTPException(status_code=409, detail="proxy already bound to another account (sticky 1-1)")
+        _close_binding(current, reason="reassigned")
+        binding = ProxyBinding(id=uuid.uuid4().hex, account_id=a.id,
+                               proxy_id=proxy.id, reason="assign")
+        store.proxy_bindings[binding.id] = binding
+        a.proxy_binding_id = binding.id
+        a.updated_at = utcnow()
+        append_audit(store, workspace_id=a.workspace_id, actor_id=_actor(claims),
+                     action="proxy.assign", target_type="account", target_id=a.id,
+                     detail={"proxy_id": proxy.id, "binding_id": binding.id,
+                             "previous_binding_id": current.id if current else ""})
+        return {"account_id": a.id, "proxy_id": proxy.id, "binding_id": binding.id}
 
     @app.get("/videos")
     def list_videos(account_id: Optional[str] = None, platform: Optional[Platform] = None,
@@ -443,10 +640,14 @@ def create_app(*, store: Optional[InMemoryStore] = None,
     @app.post("/proxies/import", status_code=201)
     def import_proxies(body: list[ProxyCreate], claims: dict = Depends(_auth)):
         created = []
+        claims_ws = str(claims.get("workspace_id") or "")
         for item in body:
             p = ProxyInfo(id=uuid.uuid4().hex, host=item.host, port=item.port, country=item.country,
                           credential_ref=item.credential_ref)
             store.proxies[p.id] = p
+            if claims_ws:
+                # Ghi nhan workspace so huu de assign-proxy doi chieu.
+                store.proxy_workspaces[p.id] = claims_ws
             created.append(p.id)
         return {"created": created, "count": len(created)}
 
