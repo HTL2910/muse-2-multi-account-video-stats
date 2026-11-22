@@ -1,4 +1,4 @@
 platform,iterations,success_rate,latency_ms_mean,latency_ms_p95,proxy
-facebook,200,1.0,0.0016,0.0019,local-parser (no network)
-tiktok,200,1.0,0.0008,0.0009,local-parser (no network)
-youtube,200,1.0,0.001,0.0012,local-parser (no network)
+facebook,200,1.0,0.002,0.0027,local-parser (no network)
+tiktok,200,1.0,0.0009,0.0013,local-parser (no network)
+youtube,200,1.0,0.0009,0.001,local-parser (no network)
