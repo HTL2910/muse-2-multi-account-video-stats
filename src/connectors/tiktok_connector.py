@@ -12,6 +12,15 @@ does not expose (e.g. saves for some accounts) are filled ONLY by the
 controlled supplemental (web/browser) path, and the resulting metric
 is labelled MetricSource.BROWSER_FALLBACK so API vs supplemental data
 are never mixed silently.
+
+READ-ONLY by design (least privilege): this system only READS video
+statistics. REQUIRED_SCOPES therefore contains read scopes only
+(user.info.basic, video.list) plus read-only insights scopes in
+OPTIONAL_SCOPES. The connector NEVER requests an upload/publish or
+any other write scope, and it never posts, likes or comments on behalf
+of the user — a write scope would let a leaked token publish content
+as the user and makes the OAuth app review fail for a stats-only
+product.
 """
 from __future__ import annotations
 
@@ -63,8 +72,15 @@ __all__ = [
 
 PLATFORM = Platform.TIKTOK
 BASE_URL = "https://open.tiktokapis.com/v2"
-REQUIRED_SCOPES = ["user.info.basic", "video.list", "video.upload"]
+# Read-only scope set (see module docstring): identity + video list/stats.
+# The upload scope was removed — it is a WRITE scope (post videos as the
+# user) and a read-only stats system must never request it.
+REQUIRED_SCOPES = ["user.info.basic", "video.list"]
 OPTIONAL_SCOPES = ["user.info.stats", "video.insights"]
+# Guard rail: no requested scope may ever be a write scope.
+assert not any(("upload" in s or "publish" in s)
+               for s in REQUIRED_SCOPES + OPTIONAL_SCOPES), (
+    "read-only TikTok connector must never request write scopes")
 
 
 class TikTokAPIError(RuntimeError):
