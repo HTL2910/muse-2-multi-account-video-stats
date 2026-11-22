@@ -8,7 +8,24 @@ Rules (fail-closed / no guessing):
   that the platform did not return; counters genuinely absent stay 0 but the
   snapshot is flagged PARTIAL so dashboards can exclude it from KPI sums)
 - implausible spike vs previous snapshot -> NEEDS_REVIEW, kept out of store
-- dedupe by UnifiedVideoMetric.idempotency_key (account, platform_video, day)
+- dedupe by UnifiedVideoMetric.idempotency_key (account, platform_video, hour)
+
+Fix (fix_unified_store_pipeline_wiring):
+- Fail-closed gate at the head of run(): an account in FAIL_CLOSED_STATUSES
+  or a bound proxy that is not ACTIVE is REJECTED and the adapter is never
+  called — CHECKPOINT/BANNED accounts are no longer crawled.
+- One canonical metrics store: this module's InMemoryMetricsStore delegates
+  to src.core.models.InMemoryMetricsStore (the canonical implementation
+  after fix_core_store_return_type); it is not a third, divergent copy.
+  Use get_shared_store() as the single shared instance that the scheduler
+  worker, the pipeline and the API all read through DI — a sync must land
+  in the same store the dashboard reads, otherwise GET /videos stays empty.
+- State machine: this module never transitions an account itself. The only
+  canonical transition is src.accounts.account_model.transition; core's
+  transition_account must delegate to it (follow-up in its own file).
+- src/registry.py (an empty registry dict only, imported by nobody) is
+  dead code and is deleted by the merge step (git rm); it cannot be
+  deleted from this branch, which may only submit this file + its test.
 Stdlib only.
 """
 from __future__ import annotations
@@ -16,16 +33,22 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import Any, Iterable, Optional, Protocol
+from typing import Any, Callable, Iterable, Optional, Protocol
 
 from src.contracts import (
     BatchDecision, DataQuality, JobResult, JobStatus, MetricSource, Platform,
-    PlatformAccount, UnifiedVideoMetric, Video, VideoStatsSnapshot, VideoStatus,
-    build_idempotency_key, date_bucket, utcnow, validate_metric,
+    PlatformAccount, ProxyInfo, ProxyStatus, UnifiedVideoMetric, Video,
+    VideoStatsSnapshot, VideoStatus, date_bucket,
+    is_fail_closed_status, utcnow, validate_metric,
 )
 
+try:  # canonical store lives in src.core.models
+    from src.core.models import InMemoryMetricsStore as _CoreMetricsStore
+except ImportError:  # called as package src.ingestion.*
+    from ..core.models import InMemoryMetricsStore as _CoreMetricsStore
+
 __all__ = ["InMemoryMetricsStore", "IngestionPipeline", "PipelineReport",
-           "normalize_raw_metric", "RAW_FIELD_MAP"]
+           "normalize_raw_metric", "RAW_FIELD_MAP", "get_shared_store"]
 
 # Raw platform field -> unified field. watch_time unified unit is SECONDS.
 RAW_FIELD_MAP: dict[Platform, dict[str, str]] = {
@@ -95,32 +118,49 @@ def normalize_raw_metric(raw: dict[str, Any], *, video: Video,
         quality=quality, date_bucket=date_bucket(ts))
 
 
-class InMemoryMetricsStore:
-    """MetricsStore protocol impl. (in-memory; production: PG + Timescale)."""
+class InMemoryMetricsStore(_CoreMetricsStore):
+    """Canonical MetricsStore for ingestion — delegates to core, not a copy.
 
-    def __init__(self) -> None:
-        self._by_key: dict[str, VideoStatsSnapshot] = {}
-        self._by_video: dict[str, list[UnifiedVideoMetric]] = {}
+    Inherits save_snapshot() (returns VideoStatsSnapshot), get_history(),
+    get_latest() and daily_rollup() from src.core.models. Only the
+    pipeline-specific extras live here: __len__ and get_latest() returning
+    the max by collected_at (correct when snapshots arrive out of order).
+    If the core store predates fix_core_store_return_type and still
+    returns a bare UnifiedVideoMetric, wrap it here so this store always
+    honours the protocol.
+    """
 
     def save_snapshot(self, metric: UnifiedVideoMetric) -> VideoStatsSnapshot:
-        key = metric.idempotency_key
-        if key in self._by_key:  # idempotent: same day snapshot already stored
-            return self._by_key[key]
-        snap = VideoStatsSnapshot(id=uuid.uuid4().hex, metric=metric)
-        self._by_key[key] = snap
-        self._by_video.setdefault(metric.video_id, []).append(metric)
-        return snap
-
-    def get_history(self, *, video_id: str, start: datetime, end: datetime):
-        return [m for m in self._by_video.get(video_id, [])
-                if start <= m.collected_at <= end]
+        result = super().save_snapshot(metric)
+        if isinstance(result, VideoStatsSnapshot):
+            return result
+        return VideoStatsSnapshot(id=uuid.uuid4().hex, metric=result, raw_payload_ref="")
 
     def get_latest(self, *, video_id: str) -> Optional[UnifiedVideoMetric]:
-        rows = self._by_video.get(video_id, [])
+        rows = self._history.get(video_id, [])
         return max(rows, key=lambda m: m.collected_at) if rows else None
 
     def __len__(self) -> int:
         return len(self._by_key)
+
+
+_SHARED_STORE: Optional[InMemoryMetricsStore] = None
+
+
+def get_shared_store() -> InMemoryMetricsStore:
+    """The single shared metrics store for one process.
+
+    Wiring point: the scheduler worker, the pipeline and the API's
+    create_app must all be given this same instance (DI) instead of
+    each constructing its own InMemoryMetricsStore — otherwise a sync
+    writes to one store and GET /videos reads an empty other one.
+    Production replaces it with the PG/Timescale implementation of the
+    same contracts.MetricsStore protocol; the call sites do not change.
+    """
+    global _SHARED_STORE
+    if _SHARED_STORE is None:
+        _SHARED_STORE = InMemoryMetricsStore()
+    return _SHARED_STORE
 
 
 @dataclass
@@ -133,8 +173,16 @@ class PipelineReport:
     partial: int = 0
     removed_video_ids: list[str] = field(default_factory=list)
     decision: BatchDecision = BatchDecision.ACCEPT
+    rejected_reason: str = ""
 
     def to_job_result(self, job_id: str) -> JobResult:
+        if self.decision is BatchDecision.REJECT:
+            return JobResult(job_id=job_id, status=JobStatus.REJECTED,
+                             account_id=self.account_id,
+                             videos_found=self.videos_found,
+                             metrics_written=self.metrics_written,
+                             decision=self.decision,
+                             error_code=self.rejected_reason or "REJECTED")
         status = JobStatus.SUCCEEDED if self.decision in (
             BatchDecision.ACCEPT, BatchDecision.PARTIAL) else JobStatus.FAILED
         return JobResult(job_id=job_id, status=status, account_id=self.account_id,
@@ -155,10 +203,22 @@ class IngestionPipeline:
 
     def __init__(self, adapter: _AdapterProto, store: InMemoryMetricsStore, *,
                  spike_ratio: float = 10.0, spike_floor: int = 100_000,
-                 known_video_ids: Optional[Iterable[str]] = None):
+                 known_video_ids: Optional[Iterable[str]] = None,
+                 proxy_resolver: Optional[Callable[[PlatformAccount], Optional[ProxyInfo]]] = None):
         self._adapter, self._store = adapter, store
         self._spike_ratio, self._spike_floor = spike_ratio, spike_floor
         self._known: set[str] = set(known_video_ids or [])
+        # Optional: resolves the account's sticky proxy. The scheduler/API
+        # factory must supply it (or pass proxy= to run()); without a
+        # resolver and without an explicit proxy the proxy check is skipped
+        # because the pipeline cannot know the proxy — it is not a licence
+        # to run proxy-less in production.
+        self._proxy_resolver = proxy_resolver
+
+    @property
+    def store(self) -> InMemoryMetricsStore:
+        """The store this pipeline writes to — the same instance the API reads."""
+        return self._store
 
     def _classify(self, metric: UnifiedVideoMetric) -> DataQuality:
         if validate_metric(metric):
@@ -172,8 +232,32 @@ class IngestionPipeline:
                 return DataQuality.NEEDS_REVIEW
         return metric.quality
 
+    def _fail_closed_rejection(self, account: PlatformAccount,
+                               proxy: Optional[ProxyInfo] = None) -> Optional[PipelineReport]:
+        """Fail-closed gate, run before any adapter call. Returns a REJECT
+        report or None (allowed to proceed)."""
+        if is_fail_closed_status(account.status):
+            return PipelineReport(
+                account_id=account.id, decision=BatchDecision.REJECT,
+                rejected_reason=f"account status {account.status.value} is fail-closed")
+        effective = proxy
+        if effective is None and self._proxy_resolver is not None:
+            effective = self._proxy_resolver(account)
+            if effective is None:
+                return PipelineReport(
+                    account_id=account.id, decision=BatchDecision.REJECT,
+                    rejected_reason="no proxy bound (fail-closed: no default proxy)")
+        if effective is not None and effective.status != ProxyStatus.ACTIVE:
+            return PipelineReport(
+                account_id=account.id, decision=BatchDecision.REJECT,
+                rejected_reason=f"proxy status {effective.status.value} is not ACTIVE")
+        return None
+
     def run(self, account: PlatformAccount, *, job_id: str = "",
-            limit: int = 50) -> PipelineReport:
+            limit: int = 50, proxy: Optional[ProxyInfo] = None) -> PipelineReport:
+        rejected = self._fail_closed_rejection(account, proxy)
+        if rejected is not None:
+            return rejected
         report = PipelineReport(account_id=account.id)
         # 1) Discover
         videos = self._adapter.list_videos(account, limit=limit)
@@ -190,8 +274,10 @@ class IngestionPipeline:
             # 3) Normalize invariants: UTC bucket + canonical idempotency key
             if metric.date_bucket != date_bucket(metric.collected_at):
                 metric = replace(metric, date_bucket=date_bucket(metric.collected_at))
-            key = build_idempotency_key(metric.account_id, metric.platform_video_id,
-                                        metric.date_bucket)
+            # Dedup trong mot lan run theo dung idempotency_key cua metric
+            # (theo gio sau fix_idempotency_hourly_bucket), khong phai theo
+            # ngay — neu khong snapshot gio thu 2 trong ngay se bi loai oan.
+            key = metric.idempotency_key
             if key in seen_keys:
                 report.duplicates_skipped += 1
                 continue
