@@ -1,0 +1,25 @@
+{
+  "kind": "youtube#videoListResponse",
+  "items": [
+    {
+      "id": "yt_video_001",
+      "snippet": {
+        "title": "Sample YT Video",
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "thumbnails": {
+          "high": {
+            "url": "https://example.invalid/thumb.jpg"
+          }
+        }
+      },
+      "contentDetails": {
+        "duration": "PT3M20S"
+      },
+      "statistics": {
+        "viewCount": "98000",
+        "likeCount": "6100",
+        "commentCount": "540"
+      }
+    }
+  ]
+}
