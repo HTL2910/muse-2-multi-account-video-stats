@@ -13,6 +13,21 @@ khi monitor loi, khong bao gio log/tra secret plaintext.
 - Golden test: fixture co dinh, CI phat hien API doi schema
 - Kill-switch: dung toan bo crawl khi ti le loi vuot nguong
 Chi dung thu vien chuan.
+
+Fix (fix_monitor_golden_killswitch_prometheus):
+- GoldenRunner unwrap de quy fixture shape (TikTok data la dict
+  {'videos': [...]}): items=raw.get('data', []) cu cho len=3 (so key)
+  va items[0] KeyError. Gio data dict co 'videos' thi lay videos,
+  data la list thi giu nguyen, data long nhau thi unwrap tiep.
+- Kill-switch: nguong mac dinh cu 0.9 (RISK_STOP_THRESHOLD) qua muon
+  va khong noi nao kiem tra tripped nen la dead code. Tach nguong
+  rieng KILL_SWITCH_ERROR_RATE_THRESHOLD=0.4 (cau hinh duoc 0.3-0.5)
+  va them kill_switch_gate() / Monitor.check_kill_switch() ma
+  TaskSchedulerImpl.enqueue()/acquire_job() BAT BUOC phai goi va
+  REJECT job khi da trip — phan noi vao scheduler thuoc file scheduler,
+  khong nop o nhanh nay.
+- Prometheus: # TYPE chi in mot lan cho moi ten metric, nhom cac dong
+  label duoi no, thay vi in truoc moi dong label.
 """
 from __future__ import annotations
 
@@ -27,14 +42,14 @@ from typing import Any, Callable, Optional
 
 try:
     from src.contracts import (  # type: ignore
-        RISK_STOP_THRESHOLD, AccountStatus, Alert, AlertSeverity, AlertType,
+        AccountStatus, Alert, AlertSeverity, AlertType,
         BatchDecision, DataQuality, GoldenCase, JobStatus, Platform,
         PlatformAccount, ProxyInfo, ProxyStatus, UnifiedVideoMetric,
         is_fail_closed_status, utcnow, validate_metric,
     )
 except ImportError:
     from ..contracts import (  # type: ignore
-        RISK_STOP_THRESHOLD, AccountStatus, Alert, AlertSeverity, AlertType,
+        AccountStatus, Alert, AlertSeverity, AlertType,
         BatchDecision, DataQuality, GoldenCase, JobStatus, Platform,
         PlatformAccount, ProxyInfo, ProxyStatus, UnifiedVideoMetric,
         is_fail_closed_status, utcnow, validate_metric,
@@ -44,7 +59,15 @@ __all__ = [
     "redact", "new_trace_id", "Monitor", "BatchGateResult",
     "validate_batch", "fail_closed_gate", "KillSwitch",
     "GoldenRunner", "InMemoryAlertNotifier",
+    "KILL_SWITCH_ERROR_RATE_THRESHOLD", "kill_switch_gate",
+    "unwrap_fixture_items",
 ]
+
+# Nguong kill-switch RIENG, khong dung RISK_STOP_THRESHOLD (0.9) nua:
+# 0.9 nghia la cho toi khi 9/10 job loi moi dung — qua muon de cuu
+# account/proxy. 0.4 dung som hon nhieu trong khi van chiu duoc loi
+# roi rac (min_samples=20).
+KILL_SWITCH_ERROR_RATE_THRESHOLD = 0.4
 
 # Pattern redact: token/secret/password/cookie — thay bang ***.
 _SECRET_RE = re.compile(
@@ -65,6 +88,31 @@ def redact(text: str) -> str:
 
 def new_trace_id() -> str:
     return uuid.uuid4().hex
+
+
+def unwrap_fixture_items(raw: Any) -> list:
+    """Unwrap de quy fixture ve list video.
+
+    Cac shape that co trong repo:
+    - [ {...}, {...} ]                       -> giu nguyen
+    - {"data": [ {...}, ... ]}               -> data
+    - {"data": {"videos": [...], ...}}       -> data.videos (TikTok)
+    - {"videos": [...]}                      -> videos
+    - {"data": {"data": [...]}}              -> unwrap tiep
+    Shape khac / khong phai list/dict -> [] (khong doan kieu).
+    """
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        for key in ("videos", "items"):
+            value = raw.get(key)
+            if isinstance(value, list):
+                return value
+        data = raw.get("data")
+        if data is not None:
+            return unwrap_fixture_items(data)
+        return []
+    return []
 
 
 @dataclass
@@ -111,7 +159,7 @@ def fail_closed_gate(account: PlatformAccount, proxy: Optional[ProxyInfo]) -> tu
 class KillSwitch:
     """Dung toan bo crawl khi ti le loi vuot nguong trong cua so truot."""
 
-    def __init__(self, *, error_rate_threshold: float = RISK_STOP_THRESHOLD,
+    def __init__(self, *, error_rate_threshold: float = KILL_SWITCH_ERROR_RATE_THRESHOLD,
                  window: int = 100, min_samples: int = 20):
         self.threshold = error_rate_threshold
         self.window = window
@@ -141,6 +189,21 @@ class KillSwitch:
         self.tripped_at = None
 
 
+def kill_switch_gate(kill_switch: KillSwitch) -> tuple[bool, str]:
+    """Gate ma scheduler BAT BUOC phai goi truoc enqueue()/acquire_job().
+
+    (True, '') = duoc chay; (False, ly_do) = REJECT job, khong enqueue,
+    khong goi adapter. Chi kiem tra o day moi lam kill-switch song,
+    thay vi chi ghi lai roi khong ai doc.
+    """
+    if kill_switch.tripped:
+        return False, (
+            f"kill-switch tripped (error_rate={kill_switch.error_rate:.2f} "
+            f">= threshold={kill_switch.threshold:.2f}); crawl stopped"
+        )
+    return True, ""
+
+
 class InMemoryAlertNotifier:
     """AlertNotifier protocol (in-memory; production gan Telegram/Webhook)."""
 
@@ -155,13 +218,25 @@ class Monitor:
     """Observability hub: metrics, trace, log redact, alert, kill-switch."""
 
     def __init__(self, *, notifier: Optional[InMemoryAlertNotifier] = None,
-                 logger: Optional[logging.Logger] = None):
+                 logger: Optional[logging.Logger] = None,
+                 kill_switch: Optional[KillSwitch] = None,
+                 kill_switch_threshold: float = KILL_SWITCH_ERROR_RATE_THRESHOLD):
         self.notifier = notifier or InMemoryAlertNotifier()
         self.logger = logger or logging.getLogger("multi_account_video_stats")
         self._counters: Counter = Counter()
         self._gauges: dict[str, float] = {}
-        self.kill_switch = KillSwitch()
+        self.kill_switch = kill_switch or KillSwitch(
+            error_rate_threshold=kill_switch_threshold)
         self._error_window: deque[bool] = deque(maxlen=100)
+
+    @property
+    def error_rate(self) -> float:
+        """Ti le loi trong cua so truot (cung cua so kill-switch dung)."""
+        return self.kill_switch.error_rate
+
+    def check_kill_switch(self) -> tuple[bool, str]:
+        """Tien ich cho scheduler: giong kill_switch_gate(self.kill_switch)."""
+        return kill_switch_gate(self.kill_switch)
 
     # -- metrics (Prometheus exposition, khong can client lib) ------------
     def inc(self, name: str, *, labels: Optional[dict[str, str]] = None, value: int = 1) -> None:
@@ -172,10 +247,16 @@ class Monitor:
         self._gauges[name] = value
 
     def prometheus_text(self) -> str:
+        # Nhom counter theo ten metric: in '# TYPE <ten> counter' MOT
+        # LAN cho moi ten, roi moi in cac dong label duoi no.
         lines = []
+        grouped: dict[str, list[tuple[str, int]]] = {}
         for k, v in sorted(self._counters.items()):
-            name = k.split("{")[0]
-            lines.append(f"# TYPE {name} counter\n{k} {v}")
+            grouped.setdefault(k.split("{")[0], []).append((k, v))
+        for name in sorted(grouped):
+            lines.append(f"# TYPE {name} counter")
+            for k, v in grouped[name]:
+                lines.append(f"{k} {v}")
         for k, v in sorted(self._gauges.items()):
             lines.append(f"# TYPE {k} gauge\n{k} {v}")
         return "\n".join(lines) + ("\n" if lines else "")
@@ -235,7 +316,7 @@ class GoldenRunner:
             raw = self._load(case.raw_fixture_path)
         except Exception as exc:
             return False, [f"cannot load fixture {case.raw_fixture_path}: {exc}"]
-        items = raw if isinstance(raw, list) else raw.get("data", [])
+        items = unwrap_fixture_items(raw)
         if len(items) != case.expected_video_count:
             errors.append(f"video count {len(items)} != expected {case.expected_video_count}")
         if case.expected_metric is not None and items:
