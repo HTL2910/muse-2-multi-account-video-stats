@@ -5,6 +5,14 @@ cryptography la dependency production (khong phai dev-only / optional) de
 vault khong bao gio roi lang le ve fallback stdlib, va cac dependency da
 cai dung khop pin (ke ca AES-256-GCM that).
 
+Cong doi chieu merge (meta-gate): TRIAGED_FIXES_REQUIRED liet ke moi fix
+da triage co file test tren main; neu mot merge lam mat file test cua
+mot fix trong danh sach, test nay do — merge do coi nhu chua xong.
+TRIAGED_FIXES_KNOWN_MISSING liet ke cac fix da nop nhung chua co file
+test tren main (dang xfail, khong do suite); khi mot fix trong do merge
+xong, chuyen no sang REQUIRED. Them fix moi da triage = them mot dong
+vao REQUIRED cung voi file test cua no.
+
 Chi dung stdlib + pytest; khong import bat ky module src nao.
 """
 from __future__ import annotations
@@ -19,6 +27,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = REPO_ROOT / "pyproject.toml"
+TESTS_DIR = REPO_ROOT / "tests"
 
 # Pin duoc khoa trong pyproject.toml (phai khop file that).
 EXPECTED_PROD = {
@@ -29,6 +38,51 @@ EXPECTED_PROD = {
     "uvicorn": "0.54.0",
 }
 EXPECTED_DEV = {"pytest": "9.2.0"}
+
+# Fix da triage co file test tren main (kiem chung tu danh sach file main).
+# Them fix moi: them mot dong o day CUNG VOI file test cua no.
+TRIAGED_FIXES_REQUIRED = {
+    "fix_alert_group_workspace_telegram": "test_fix_alert_group_workspace_telegram.py",
+    "fix_api_cursor_offset": "test_fix_api_cursor_offset.py",
+    "fix_api_import_delete_assign_audit": "test_fix_api_import_delete_assign_audit.py",
+    "fix_audit_chain_thread_safety": "test_fix_audit_chain_thread_safety.py",
+    "fix_browser_profile_missing": "test_fix_browser_profile_missing.py",
+    "fix_contracts_version_stale_tests": "test_fix_contracts_version_stale_tests.py",
+    "fix_docker_compose_companions": "test_fix_docker_compose_companions.py",
+    "fix_docker_compose_unrunnable": "test_fix_docker_compose_unrunnable.py",
+    "fix_facebook_token_thumbnail": "test_fix_facebook_token_thumbnail.py",
+    "fix_frontend_backend_contract_mismatch": "test_fix_frontend_backend_contract_mismatch.py",
+    "fix_frontend_missing_manifest": "test_fix_frontend_missing_manifest.py",
+    "fix_golden_missing_youtube": "test_fix_golden_missing_youtube.py",
+    "fix_idempotency_hourly_bucket": "test_fix_idempotency_hourly_bucket.py",
+    "fix_import_dual_contracts": "test_fix_import_dual_contracts.py",
+    "fix_ingestion_normalize_removed": "test_fix_ingestion_normalize_removed.py",
+    "fix_missing_dependency_manifest": "test_fix_missing_dependency_manifest.py",
+    "fix_missing_tests_critical_modules": "test_fix_missing_tests_critical_modules.py",
+    "fix_pipeline_fail_closed_wiring": "test_fix_pipeline_fail_closed_wiring.py",
+    "fix_proxy_pool_fail_closed": "test_fix_proxy_pool_fail_closed.py",
+    "fix_scheduler_enqueue_fail_open": "test_fix_scheduler_enqueue_fail_open.py",
+    "fix_scheduler_quota_proxy_per_account": "test_fix_scheduler_quota_proxy_per_account.py",
+    "fix_scheduler_scheduled_at_lost": "test_fix_scheduler_scheduled_at_lost.py",
+    "fix_test_portability_stub_contracts": "test_fix_test_portability_stub_contracts.py",
+    "fix_tiktok_auth_fabricated": "test_fix_tiktok_auth_fabricated.py",
+    "fix_tiktok_scope_test_auth": "test_fix_tiktok_scope_test_auth.py",
+    "fix_tiktok_upload_scope": "test_fix_tiktok_upload_scope.py",
+    "fix_timeseries_rollup_ddl": "test_fix_timeseries_rollup_ddl.py",
+    "fix_token_lock_distributed": "test_fix_token_lock_distributed.py",
+    "fix_vault_kek_fallback_wipe": "test_fix_vault_kek_fallback_wipe.py",
+    "fix_youtube_quota_cache_channel": "test_fix_youtube_quota_cache_channel.py",
+}
+
+# Fix da nop nhung chua co file test tren main — dang xfail de suite van
+# xanh; khi chung merge xong thi chuyen sang REQUIRED. (fix_unified_store_
+# pipeline_wiring khong co o day: no da duoc thay the boi
+# fix_pipeline_fail_closed_wiring va da merge.)
+TRIAGED_FIXES_KNOWN_MISSING = {
+    "fix_core_store_return_type": "test_fix_core_store_return_type.py",
+    "fix_import_dual_contracts_residual": "test_fix_import_dual_contracts_residual.py",
+    "fix_monitor_golden_killswitch_prometheus": "test_fix_monitor_golden_killswitch_prometheus.py",
+}
 
 
 def _load_pyproject() -> dict:
@@ -89,6 +143,20 @@ def test_dev_dependencies_pinned():
         )
 
 
+def test_pyproject_is_the_single_manifest():
+    """Chi co pyproject.toml; khong them requirements.txt song song de
+    hai manifest lech nhau."""
+    assert not (REPO_ROOT / "requirements.txt").is_file()
+    assert not (REPO_ROOT / "requirements-dev.txt").is_file()
+
+
+def test_pytest_pythonpath_puts_repo_root_on_sys_path():
+    """Khong can tests/conftest.py rieng: pythonpath=["."] trong
+    pyproject dat repo root len sys.path de `import src.*` chay duoc."""
+    opts = _load_pyproject().get("tool", {}).get("pytest", {}).get("ini_options", {})
+    assert "." in opts.get("pythonpath", [])
+
+
 def test_no_local_venv_or_tmp_path_in_manifest():
     text = PYPROJECT.read_text(encoding="utf-8")
     for forbidden in (".venv", "/tmp/m2", "C:\\Users", "file://"):
@@ -118,3 +186,30 @@ def test_cryptography_aesgcm_available():
     nonce = b"\x00" * 12
     ct = aes.encrypt(nonce, b"manifest-check", None)
     assert aes.decrypt(nonce, ct, None) == b"manifest-check"
+
+
+@pytest.mark.parametrize(
+    "fix_code,test_file", sorted(TRIAGED_FIXES_REQUIRED.items())
+)
+def test_triaged_fix_test_file_present_on_main(fix_code, test_file):
+    """Cong doi chieu merge: fix da triage ma mat file test tren main
+    thi merge do coi nhu chua xong."""
+    assert (TESTS_DIR / test_file).is_file(), (
+        f"fix {fix_code} da triage nhung thieu file test "
+        f"tests/{test_file} tren main (merge lam mat fix?)"
+    )
+
+
+@pytest.mark.parametrize(
+    "fix_code,test_file",
+    [pytest.param(code, f, marks=pytest.mark.xfail(
+        reason=f"fix {code} da nop nhung chua merge file test",
+        strict=False))
+     for code, f in sorted(TRIAGED_FIXES_KNOWN_MISSING.items())],
+)
+def test_known_missing_fix_test_file(fix_code, test_file):
+    """Theo doi cac fix da nop nhung chua co file test tren main.
+    Khi mot fix merge xong, test nay tu pass — chuyen no sang REQUIRED."""
+    assert (TESTS_DIR / test_file).is_file(), (
+        f"fix {fix_code} van thieu file test tests/{test_file} tren main"
+    )
