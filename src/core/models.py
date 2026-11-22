@@ -5,9 +5,33 @@ schema chung trong ``src.contracts``; moi nen tang la mot Adapter.
 Khong goi truc tiep API nen tang tu core, khong log secret, fail-closed
 theo ``ALLOWED_ACCOUNT_TRANSITIONS`` / ``FAIL_CLOSED_STATUSES``.
 
-Chi dung thu vien chuan. Import contracts theo ca 2 cach (goi tu repo
-root ``src.contracts`` hoac goi trong package ``..contracts``) de
-module chay duoc ca khi chay ``python -m`` lan khi import tu root.
+Chi dung thu vien chuan. Import contracts theo DUY NHAT mot cach:
+``from src.contracts import ...`` chay tu repo root. Khong con khoi
+fallback hai kieu import nua (xem Fix).
+
+Fix (fix_import_dual_contracts_residual):
+- Bo khoi fallback hai kieu import contracts. Kieu du phong co the
+  nap cung mot file thanh module thu hai (module tran vs
+  ``src.contracts``), lam Enum/dataclass identity (``is`` /
+  ``isinstance``) am tham vo giua cac module — pytest khong bat duoc
+  vi no luon import qua ``src.*`` tu repo root. Gio chi con mot
+  import, mot identity.
+- Ghi chu: day la buoc co hoc cho rieng file nay. Cac file khac van
+  con fallback (ai, analytics, browser, observability/monitor, risk,
+  facebook_connector, scheduler, tiktok_connector) thuoc PR co hoc
+  toan src/ tiep theo — khong sua o nhanh nay.
+
+Fix (fix_core_store_return_type):
+- InMemoryMetricsStore.save_snapshot() gio tra VA luu
+  VideoStatsSnapshot (id moi, metric goc, raw_payload_ref="") nhu
+  contracts.MetricsStore khai bao — khong con tra metric tran.
+  Idempotent theo metric.idempotency_key (snapshot_key theo gio tu
+  contracts 1.1.0): cung key thi tra dung snapshot cu, khong ghi de,
+  khong tao trung. get_history()/get_latest()/daily_rollup() van tra
+  UnifiedVideoMetric nhu truoc; save_snapshot van raise ValueError
+  khi validate_metric bao loi. Lop boc defensive o
+  ingestion/pipeline.py (wrap metric tran thanh snapshot) gio la du
+  thua nhung van tuong thich — khong xoa o nhanh nay.
 """
 from __future__ import annotations
 
@@ -19,56 +43,31 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Callable, Optional, Protocol
 
-try:  # repo root tren sys.path
-    from src.contracts import (  # type: ignore
-        ALLOWED_ACCOUNT_TRANSITIONS,
-        FAIL_CLOSED_STATUSES,
-        MAX_JOB_RETRIES,
-        AccountStatus,
-        AuthMethod,
-        CollectJob,
-        JobPriority,
-        JobStatus,
-        JobType,
-        MetricSource,
-        Platform,
-        PlatformAccount,
-        ProxyInfo,
-        ProxyStatus,
-        TokenSet,
-        UnifiedVideoMetric,
-        Video,
-        VideoStatsSnapshot,
-        VideoStatus,
-        is_fail_closed_status,
-        utcnow,
-        validate_metric,
-    )
-except ImportError:  # goi nhu package src.core.*
-    from ..contracts import (  # type: ignore
-        ALLOWED_ACCOUNT_TRANSITIONS,
-        FAIL_CLOSED_STATUSES,
-        MAX_JOB_RETRIES,
-        AccountStatus,
-        AuthMethod,
-        CollectJob,
-        JobPriority,
-        JobStatus,
-        JobType,
-        MetricSource,
-        Platform,
-        PlatformAccount,
-        ProxyInfo,
-        ProxyStatus,
-        TokenSet,
-        UnifiedVideoMetric,
-        Video,
-        VideoStatsSnapshot,
-        VideoStatus,
-        is_fail_closed_status,
-        utcnow,
-        validate_metric,
-    )
+# DUY NHAT mot cach import contract: tu repo root. Khong fallback.
+from src.contracts import (
+    ALLOWED_ACCOUNT_TRANSITIONS,
+    FAIL_CLOSED_STATUSES,
+    MAX_JOB_RETRIES,
+    AccountStatus,
+    AuthMethod,
+    CollectJob,
+    JobPriority,
+    JobStatus,
+    JobType,
+    MetricSource,
+    Platform,
+    PlatformAccount,
+    ProxyInfo,
+    ProxyStatus,
+    TokenSet,
+    UnifiedVideoMetric,
+    Video,
+    VideoStatsSnapshot,
+    VideoStatus,
+    is_fail_closed_status,
+    utcnow,
+    validate_metric,
+)
 
 __all__ = [
     "SPLIT_ACCOUNT_THRESHOLD", "SPLIT_VIDEOS_PER_DAY_THRESHOLD",
@@ -379,7 +378,7 @@ class CoreService:
             return False, f"account status {account.status.value} not collectable"
         return True, ""
 
-    def build_collect_job(self, account: PlatformAccount, job_type: JobType,
+    def build_collect_job(self, account: Account, job_type: JobType,
                           *, priority: JobPriority = JobPriority.NORMAL,
                           video_id: Optional[str] = None) -> CollectJob:
         # Gate proxy that duoc kiem tra o scheduler (co proxy that); o day chi tao job.
