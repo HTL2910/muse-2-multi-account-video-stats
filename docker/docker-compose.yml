@@ -1,16 +1,50 @@
 # approach_20 — Deployment packaging, backup/restore, ToS compliance.
 #
-# One-command bring-up:  docker compose -f docker/docker-compose.yml up -d --build
+# One-command bring-up (sau khi chay buoc 0):
+#   0. bash scripts/init_secrets.sh   # tao ../.secrets/*.txt, chmod 600
+#   1. docker compose -f docker/docker-compose.yml up -d --build
+#   2. docker compose -f docker/docker-compose.yml ps   # api healthy, scheduler up
 # Rules baked in:
 # - Workers are stateless & horizontally scalable (`--scale worker=N`); they
 #   hold NO local state — jobs, leases and locks live in Redis/Postgres.
 # - Graceful shutdown: stop_grace_period > job lease so in-flight jobs finish
 #   or their lease expires and another worker picks them up (no hung jobs).
 # - Secrets come from .env / Docker secrets ONLY; never baked into images.
+#   Secret files o ../.secrets/ KHONG co trong repo — chay
+#   scripts/init_secrets.sh o local truoc lan up dau tien; .gitignore
+#   phai chua `.secrets/` va `.env` (xem muc COMPANION FILES duoi day).
 # - Vault keys are backed up SEPARATELY from DB backups (different volume,
 #   different bucket, different credentials) — see `backup` / `vault-backup`.
 # - ToS: official APIs first (connectors), no automated like/comment/follow
 #   actions exist in any service; rate limits are enforced by the scheduler.
+#
+# COMPANION FILES — BAT BUOC PHAI CO O BUOC MERGE (khong thuoc nhanh nay,
+# chi duoc nop docker-compose.yml + test cua no):
+# - docker/Dockerfile.api      multi-stage, non-root, chi copy src can
+#   thiet; CMD: uvicorn src.api.main:app --host 0.0.0.0 --port 8000.
+# - docker/Dockerfile.worker   multi-stage, non-root; CMD chay vong lap
+#   worker (lay job tu scheduler, goi pipeline) — khong de trong.
+# - docker/Dockerfile.frontend multi-stage: build src/web (Next.js) roi
+#   chay bang non-root user; chi copy src/web + package.json/lockfile.
+# - src/scheduler/__main__.py  entrypoint that cua scheduler: argparse
+#   --beat, vong lap tick (mac dinh 60s, env SCHEDULER_INTERVAL_SECONDS)
+#   goi schedule_jobs_for_account() + enqueue(), xu ly SIGTERM graceful
+#   (dung tick, khong nhan job moi). Compose goi `python -m src.scheduler
+#   --beat`; lenh cu goi truc tiep module task_scheduler la lenh chet
+#   vi task_scheduler.py khong co khoi __main__.
+# - scripts/init_secrets.sh    tao ../.secrets/postgres_password.txt,
+#   vault_master_key.txt, vault_backup_passphrase.txt (gia tri ngau nhien,
+#   chmod 600); khong commit file ket qua.
+# - .gitignore                 them `.secrets/` va `.env`.
+# Khi cac file tren chua co, `docker compose config`/`build`/`up` van
+# that bai — do la loi thieu file di kem, khong phai loi cua compose nay.
+#
+# Fix (fix_docker_compose_unrunnable):
+# - api healthcheck probe dung endpoint /health that cua FastAPI.
+# - scheduler command -> `python -m src.scheduler --beat` (entrypoint that).
+# - backup: pg_dump khong doc password tu bien moi truong dang *_FILE
+#   (chi docker entrypoint cua image postgres moi doc); lay password tu
+#   /run/secrets vao PGPASSWORD ngay trong entrypoint.
 name: multi-account-video-stats
 
 x-common: &common
@@ -64,7 +98,7 @@ services:
     ports: ["${API_PORT:-8000}:8000"]
     stop_grace_period: 30s
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/healthz')"]
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -72,6 +106,8 @@ services:
   worker:
     <<: *common
     build: { context: .., dockerfile: docker/Dockerfile.worker }
+    # Khong co command o day: Dockerfile.worker PHAI dinh nghia CMD chay
+    # vong lap worker (xem COMPANION FILES). De trong CMD la loi khoi dong.
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-stats}@postgres:5432/${POSTGRES_DB:-stats}
       REDIS_URL: redis://redis:6379/0
@@ -92,10 +128,14 @@ services:
   scheduler:
     <<: *common
     build: { context: .., dockerfile: docker/Dockerfile.worker }
-    command: ["python", "-m", "src.scheduler.task_scheduler", "--beat"]
+    # Entrypoint that: src/scheduler/__main__.py (xem COMPANION FILES).
+    # Lenh cu goi truc tiep module task_scheduler chet ngay vi file do
+    # khong co khoi __main__ / khong parse argv.
+    command: ["python", "-m", "src.scheduler", "--beat"]
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql://${POSTGRES_USER:-stats}@postgres:5432/${POSTGRES_DB:-stats}
+      SCHEDULER_INTERVAL_SECONDS: "${SCHEDULER_INTERVAL_SECONDS:-60}"
     depends_on:
       redis: { condition: service_healthy }
       postgres: { condition: service_healthy }
@@ -116,12 +156,11 @@ services:
   backup:                                # database only — contains NO vault keys
     image: postgres:16-alpine
     environment:
-      PGPASSWORD_FILE: /run/secrets/postgres_password
       BACKUP_RETENTION_DAYS: "${BACKUP_RETENTION_DAYS:-14}"
     secrets: [postgres_password]
     volumes:
       - db_backups:/backups
-    entrypoint: ["sh", "-c", "while true; do pg_dump -h postgres -U $${POSTGRES_USER:-stats} $${POSTGRES_DB:-stats} | gzip > /backups/db-$$(date +%F-%H%M).sql.gz; find /backups -mtime +$${BACKUP_RETENTION_DAYS:-14} -delete; sleep 86400; done"]
+    entrypoint: ["sh", "-c", "export PGPASSWORD=$(cat /run/secrets/postgres_password); while true; do pg_dump -h postgres -U $${POSTGRES_USER:-stats} $${POSTGRES_DB:-stats} | gzip > /backups/db-$$(date +%F-%H%M).sql.gz; find /backups -mtime +$${BACKUP_RETENTION_DAYS:-14} -delete; sleep 86400; done"]
     depends_on:
       postgres: { condition: service_healthy }
 
@@ -145,6 +184,8 @@ volumes:
   vault_key_backups:   # ship off-site separately from db_backups
 
 secrets:
+  # Tao truoc lan up dau tien: bash scripts/init_secrets.sh
+  # (file o ../.secrets/, git-ignored, chmod 600).
   postgres_password: { file: ../.secrets/postgres_password.txt }
   vault_master_key: { file: ../.secrets/vault_master_key.txt }
   vault_backup_passphrase: { file: ../.secrets/vault_backup_passphrase.txt }
