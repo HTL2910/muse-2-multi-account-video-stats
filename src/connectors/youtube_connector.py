@@ -9,16 +9,48 @@ channels.list=1, playlistItems.list=1, playlists.list=1; Analytics
 report tam tinh 1-5. Han muc mac dinh 10_000 units/ngay/project.
 Connector tu dem quota, cache, batch id (toi da 50/lan goi videos.list),
 va tu choi fail-closed khi vuot quota thay vi goi mu.
+
+Fix ``fix_youtube_quota_cache_channel`` (gop
+fix_youtube_quota_per_instance_and_chann +
+fix_youtube_cache_stale_and_mutable):
+- Quota la ngan sach cua GOOGLE CLOUD PROJECT, khong phai cua tung
+  connector: QuotaTracker nay chi la mat tien (facade) tren mot
+  QuotaStore DUNG CHUNG theo project_id — increment nguyen tu
+  (check-and-add trong cung mot thao tac khoa/Lua), khoa theo ngay
+  UTC cua project nen tu roll sang ngay moi. Backend san co:
+  InMemoryQuotaStore (instance dung chung cap process — mac dinh,
+  chi dung duoc khi moi worker o cung process) va RedisQuotaStore
+  (INCRBY + kiem tra gioi han bang Lua, production nhieu worker).
+  Khong truy cap duoc store quota thi charge() raise
+  QuotaExceededError — FAIL-CLOSED, khong goi API mu.
+- Cache: tra ve ban DEEPCOPY ca khi ghi va khi doc — caller sua dict
+  nhan duoc khong lam hong cache, cache cung khong tra cung mot dict
+  mutable cho hai caller. videos.list co part statistics KHONG duoc
+  cache (so lieu thay doi lien tuc; snapshot moi khong bao gio mang
+  so cu 300s nua); chi cache metadata it doi (channels.list,
+  videos.list khong statistics, playlistItems.list) voi TTL rieng
+  theo loai du lieu. Cache key chua project_id + account_id + method
+  + params: hai account khac nhau khong bao gio dung chung mot entry
+  (list_channels mine=true truoc day tra nham channel cua account
+  khac vi key khong co account).
+- channel_id: truoc day doc account.__dict__['payload'] — PlatformAccount
+  khong co field payload nen do la DEAD CODE, luc nao cung roi ve
+  platform_user_id. Nay thu tu ro rang: (1) bang mapping
+  account->channel cua connector (register_channel / channel_map),
+  (2) field account.channel_id neu contracts co khai bao, (3)
+  account.platform_user_id.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
+import os
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Optional
+from typing import Callable, Optional, Protocol
 
 try:
     from src.contracts import (
@@ -33,12 +65,18 @@ except ImportError:  # pragma: no cover
 
 __all__ = ["QuotaExceededError", "YouTubeAuthError", "QuotaTracker",
            "YouTubeConnector", "parse_duration_iso8601",
-           "QUOTA_COSTS", "DAILY_QUOTA_DEFAULT"]
+           "QUOTA_COSTS", "DAILY_QUOTA_DEFAULT",
+           "QuotaStore", "InMemoryQuotaStore", "RedisQuotaStore"]
 
 QUOTA_COSTS = {"search.list": 100, "videos.list": 1, "channels.list": 1,
                "playlistItems.list": 1, "playlists.list": 1,
                "analytics.reports.query": 5}
 DAILY_QUOTA_DEFAULT = 10_000
+
+# TTL cache theo LOAI du lieu (giay). Chi metadata it doi moi duoc
+# cache; du lieu statistics/analytics khong bao gio vao bang nay.
+CACHE_TTL_METADATA = 3600.0     # channels.list: thong tin kenh it doi
+CACHE_TTL_LISTING = 300.0       # videos.list (khong statistics), playlistItems.list
 
 Transport = Callable[[str, dict], dict]
 TokenProvider = Callable[[PlatformAccount], TokenSet]
@@ -81,33 +119,140 @@ def _int(v) -> int:
         return 0
 
 
-@dataclass
-class QuotaTracker:
-    daily_limit: int = DAILY_QUOTA_DEFAULT
-    used: int = 0
-    day: str = field(default_factory=lambda: utcnow().date().isoformat())
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+def _utc_day() -> str:
+    return utcnow().date().isoformat()
 
-    def _roll(self) -> None:
-        today = utcnow().date().isoformat()
-        if today != self.day:
-            self.day, self.used = today, 0
+
+def _default_project_id() -> str:
+    return (os.environ.get("GOOGLE_CLOUD_PROJECT")
+            or os.environ.get("YOUTUBE_PROJECT_ID") or "default")
+
+
+# ---------------------------------------------------------------- Quota store
+class QuotaStore(Protocol):
+    """Bo dem quota DUNG CHUNG theo project. add() phai nguyen tu:
+    cong cost va kiem tra gioi han trong cung mot thao tac."""
+
+    def add(self, project_id: str, day: str, cost: int, limit: int) -> int:
+        """Tra tong used moi; raise QuotaExceededError neu vuot limit
+        (va KHONG cong). Loi ha tang (mat ket noi...) thi raise len —
+        QuotaTracker se chuyen thanh QuotaExceededError fail-closed."""
+        ...
+
+    def used(self, project_id: str, day: str) -> int: ...
+
+
+class InMemoryQuotaStore:
+    """QuotaStore trong RAM. Mot instance DUNG CHUNG (mac dinh la
+    singleton cap process ben duoi) cho moi QuotaTracker cung
+    project_id — cac connector trong cung process chia se mot ngan
+    sach. Nhieu process thi phai dung RedisQuotaStore."""
+
+    def __init__(self) -> None:
+        self._data: dict[tuple[str, str], int] = {}
+        self._lock = threading.Lock()
+
+    def add(self, project_id: str, day: str, cost: int, limit: int) -> int:
+        with self._lock:
+            key = (project_id, day)
+            cur = self._data.get(key, 0)
+            if cur + cost > limit:
+                raise QuotaExceededError(
+                    f"quota exceeded: project={project_id} used={cur} "
+                    f"cost={cost} limit={limit}")
+            self._data[key] = cur + cost
+            # Don khoa ngay cu cua cung project (roll theo ngay UTC)
+            for k in [k for k in self._data if k[0] == project_id and k[1] != day]:
+                del self._data[k]
+            return cur + cost
+
+    def used(self, project_id: str, day: str) -> int:
+        with self._lock:
+            return self._data.get((project_id, day), 0)
+
+
+class RedisQuotaStore:
+    """QuotaStore tren Redis: Lua script INCRBY + kiem tra gioi han
+    nguyen tu trong mot round-trip, key chua ngay UTC nen tu roll;
+    EXPIRE 48h de key tu don. ``client`` la redis-py (eval)."""
+
+    _ADD_LUA = (
+        "local used = redis.call('INCRBY', KEYS[1], ARGV[1]); "
+        "if used > tonumber(ARGV[2]) then "
+        "redis.call('INCRBY', KEYS[1], -ARGV[1]); return -1 end; "
+        "redis.call('EXPIRE', KEYS[1], ARGV[3]); return used")
+
+    def __init__(self, client, *, prefix: str = "yt-quota:"):
+        self._client = client
+        self._prefix = prefix
+
+    def _key(self, project_id: str, day: str) -> str:
+        return f"{self._prefix}{project_id}:{day}"
+
+    def add(self, project_id: str, day: str, cost: int, limit: int) -> int:
+        used = int(self._client.eval(self._ADD_LUA, 1, self._key(project_id, day),
+                                     cost, limit, 48 * 3600))
+        if used < 0:
+            raise QuotaExceededError(
+                f"quota exceeded: project={project_id} cost={cost} limit={limit}")
+        return used
+
+    def used(self, project_id: str, day: str) -> int:
+        raw = self._client.get(self._key(project_id, day))
+        return int(raw) if raw is not None else 0
+
+
+_DEFAULT_QUOTA_STORE = InMemoryQuotaStore()
+
+
+class QuotaTracker:
+    """Mat tien dem quota theo PROJECT (khong con la bo dem rieng cua
+    tung connector). Moi tracker cung project_id + cung store thi
+    chia se mot ngan sach 10k units/ngay; mac dinh store la singleton
+    in-memory cap process, production truyen RedisQuotaStore.
+
+    ``now_fn`` tiem vao de test roll ngay; mac dinh la utcnow cua
+    contracts (ngay UTC).
+    """
+
+    def __init__(self, daily_limit: int = DAILY_QUOTA_DEFAULT,
+                 *, project_id: Optional[str] = None,
+                 store: Optional[QuotaStore] = None,
+                 now_fn: Optional[Callable[[], datetime]] = None):
+        self.daily_limit = int(daily_limit)
+        self.project_id = project_id or _default_project_id()
+        self._store: QuotaStore = store or _DEFAULT_QUOTA_STORE
+        self._now_fn = now_fn or utcnow
+
+    def _today(self) -> str:
+        return self._now_fn().date().isoformat()
+
+    @property
+    def day(self) -> str:
+        return self._today()
+
+    @property
+    def used(self) -> int:
+        try:
+            return self._store.used(self.project_id, self._today())
+        except Exception as exc:
+            raise QuotaExceededError(
+                f"quota store unavailable (fail-closed): {exc}") from exc
 
     def charge(self, method: str, *, units: int = 1) -> int:
         cost = QUOTA_COSTS.get(method, 1) * units
-        with self._lock:
-            self._roll()
-            if self.used + cost > self.daily_limit:
-                raise QuotaExceededError(
-                    f"quota exceeded: used={self.used} cost={cost} limit={self.daily_limit}")
-            self.used += cost
-            return self.used
+        try:
+            return self._store.add(self.project_id, self._today(),
+                                   cost, self.daily_limit)
+        except QuotaExceededError:
+            raise
+        except Exception as exc:  # store loi/mat ket noi: FAIL-CLOSED
+            raise QuotaExceededError(
+                f"quota store unavailable (fail-closed): {exc}") from exc
 
     @property
     def remaining(self) -> int:
-        with self._lock:
-            self._roll()
-            return max(0, self.daily_limit - self.used)
+        return max(0, self.daily_limit - self.used)
 
     def should_warn(self, *, threshold: float = 0.8) -> bool:
         return self.daily_limit > 0 and (self.daily_limit - self.remaining) / self.daily_limit >= threshold
@@ -116,30 +261,75 @@ class QuotaTracker:
 class YouTubeConnector:
     """PlatformAdapter cho YouTube. 1 connector phuc vu nhieu Google
     account; moi account tu co token rieng qua token_provider (Vault).
-    Nhieu channel tren 1 Google account: channel_id nam o
-    account.platform_user_id hoac payload['channel_id'].
+    Nhieu channel tren 1 Google account: channel_id lay theo thu tu
+    mapping cua connector (register_channel) -> field channel_id cua
+    account (neu contracts co) -> account.platform_user_id.
     """
     platform = Platform.YOUTUBE
 
     def __init__(self, transport: Transport,
                  token_provider: TokenProvider | None = None,
                  *, quota: QuotaTracker | None = None,
-                 cache_ttl_seconds: float = 300.0,
+                 project_id: Optional[str] = None,
+                 channel_map: Optional[dict[str, str]] = None,
+                 cache_ttl_seconds: float = CACHE_TTL_LISTING,
                  clock: Callable[[], float] = time.monotonic):
         self._t, self._tokens = transport, token_provider
-        self.quota = quota or QuotaTracker()
+        self.project_id = project_id or (quota.project_id if quota else _default_project_id())
+        self.quota = quota or QuotaTracker(project_id=self.project_id)
+        self._channel_map: dict[str, str] = dict(channel_map or {})
         self._ttl, self._clock = cache_ttl_seconds, clock
-        self._cache: dict[str, tuple[float, dict]] = {}
+        self._cache: dict[str, tuple[float, float, dict]] = {}
         self._lock = threading.Lock()
 
+    # -- channel mapping -------------------------------------------------
+    def register_channel(self, account_id: str, channel_id: str) -> None:
+        """Gan account -> channel ro rang (bang mapping rieng cua
+        connector, dung khi 1 Google account co nhieu channel)."""
+        self._channel_map[str(account_id)] = str(channel_id)
+
+    def _channel_id(self, account: PlatformAccount) -> str:
+        mapped = self._channel_map.get(str(account.id))
+        if mapped:
+            return mapped
+        explicit = getattr(account, "channel_id", "")  # field contracts neu co
+        if explicit:
+            return str(explicit)
+        return account.platform_user_id
+
     # -- infra ---------------------------------------------------------
-    def _call(self, method: str, params: dict, *, cache: bool = True) -> dict:
-        key = hashlib.sha256(f"{method}:{sorted(params.items())}".encode()).hexdigest()
-        if cache:
+    def _cache_policy(self, method: str, params: dict) -> Optional[float]:
+        """Tra TTL neu (method, params) duoc phep cache, None neu khong.
+
+        Nguyen tac: chi metadata it doi moi duoc cache. videos.list
+        kem statistics va analytics/search KHONG bao gio duoc cache —
+        so lieu moi phai la so moi.
+        """
+        part = str(params.get("part", ""))
+        if method == "channels.list":
+            return CACHE_TTL_METADATA
+        if method == "videos.list":
+            if "statistics" in part:
+                return None
+            return self._ttl
+        if method == "playlistItems.list":
+            return self._ttl
+        return None
+
+    def _call(self, method: str, params: dict, *, cache: Optional[bool] = None,
+              account_id: Optional[str] = None) -> dict:
+        # cache=False -> khong cache; cac truong hop con lai theo
+        # policy — ke ca caller truyen cache=True cung khong ep duoc
+        # statistics vao cache.
+        ttl = None if cache is False else self._cache_policy(method, params)
+        key_src = (f"{self.project_id}:{account_id or ''}:{method}:"
+                   f"{sorted(params.items())}")
+        key = hashlib.sha256(key_src.encode()).hexdigest()
+        if ttl is not None:
             with self._lock:
                 hit = self._cache.get(key)
-                if hit and self._clock() - hit[0] < self._ttl:
-                    return hit[1]
+                if hit and self._clock() - hit[0] < hit[1]:
+                    return copy.deepcopy(hit[2])  # khong tra dict mutable dung chung
         self.quota.charge(method)
         try:
             resp = self._t(method, params)
@@ -152,16 +342,11 @@ class YouTubeConnector:
             err = resp["error"]
             if err.get("code") in (401, 403) or "auth" in str(err.get("status", "")).lower():
                 raise YouTubeAuthError(str(err.get("message", "auth error")))
-        if cache and isinstance(resp, dict):
+        if ttl is not None and isinstance(resp, dict):
             with self._lock:
-                self._cache[key] = (self._clock(), resp)
+                # Luu ban deepcopy: caller sua dict tra ve khong hong cache
+                self._cache[key] = (self._clock(), ttl, copy.deepcopy(resp))
         return resp
-
-    @staticmethod
-    def _channel_id(account: PlatformAccount) -> str:
-        return str(account.__dict__.get("payload", {}).get("channel_id")
-                   if isinstance(account.__dict__.get("payload"), dict) else "") \
-            or account.platform_user_id
 
     # -- PlatformAdapter -------------------------------------------------
     def authenticate(self, account: PlatformAccount) -> TokenSet:
@@ -175,7 +360,8 @@ class YouTubeConnector:
     def check_alive(self, account: PlatformAccount) -> bool:
         try:
             resp = self._call("channels.list",
-                              {"part": "id", "id": self._channel_id(account)})
+                              {"part": "id", "id": self._channel_id(account)},
+                              account_id=account.id)
             return bool(resp.get("items"))
         except YouTubeAuthError:
             return False
@@ -190,12 +376,14 @@ class YouTubeConnector:
     def list_channels(self, account: PlatformAccount) -> list[dict]:
         """Nhieu channel tren cung 1 Google account (mine=true)."""
         resp = self._call("channels.list",
-                          {"part": "snippet,statistics", "mine": True, "maxResults": 50})
+                          {"part": "snippet,statistics", "mine": True, "maxResults": 50},
+                          account_id=account.id)
         return list(resp.get("items") or [])
 
-    def _uploads_playlist(self, channel_id: str) -> str:
+    def _uploads_playlist(self, channel_id: str, *, account_id: Optional[str] = None) -> str:
         resp = self._call("channels.list",
-                          {"part": "contentDetails", "id": channel_id})
+                          {"part": "contentDetails", "id": channel_id},
+                          account_id=account_id)
         items = resp.get("items") or []
         if not items:
             raise YouTubeAuthError(f"channel not found: {channel_id}")
@@ -203,7 +391,7 @@ class YouTubeConnector:
 
     def list_videos(self, account: PlatformAccount, *, limit: int = 50) -> list[Video]:
         channel_id = self._channel_id(account)
-        uploads = self._uploads_playlist(channel_id)
+        uploads = self._uploads_playlist(channel_id, account_id=account.id)
         video_ids: list[str] = []
         page_token = ""
         while len(video_ids) < limit:
@@ -211,7 +399,7 @@ class YouTubeConnector:
                       "maxResults": min(50, limit - len(video_ids))}
             if page_token:
                 params["pageToken"] = page_token
-            resp = self._call("playlistItems.list", params)
+            resp = self._call("playlistItems.list", params, account_id=account.id)
             for it in resp.get("items") or []:
                 vid = (it.get("contentDetails") or {}).get("videoId")
                 if vid:
@@ -220,12 +408,14 @@ class YouTubeConnector:
             if not page_token:
                 break
         videos: list[Video] = []
-        # Batch videos.list: toi da 50 id / 1 unit - tiet kiem quota nhat
+        # Batch videos.list: toi da 50 id / 1 unit - tiet kiem quota nhat.
+        # part khong co statistics (day la metadata) nen duoc cache.
         for i in range(0, len(video_ids), 50):
             batch = video_ids[i:i + 50]
             resp = self._call("videos.list",
-                              {"part": "snippet,contentDetails,statistics,status",
-                               "id": ",".join(batch)})
+                              {"part": "snippet,contentDetails,status",
+                               "id": ",".join(batch)},
+                              account_id=account.id)
             for it in resp.get("items") or []:
                 videos.append(self._to_video(account, it))
         return videos
@@ -248,8 +438,11 @@ class YouTubeConnector:
             status=VideoStatus.ACTIVE if status == "public" else VideoStatus.PRIVATE)
 
     def get_video_stats(self, account: PlatformAccount, video: Video) -> UnifiedVideoMetric:
+        # statistics: policy cua _call chan cache -> so lieu luon moi,
+        # khong con snapshot cu 300s.
         resp = self._call("videos.list",
-                          {"part": "statistics", "id": video.platform_video_id})
+                          {"part": "statistics", "id": video.platform_video_id},
+                          account_id=account.id)
         items = resp.get("items") or []
         stats = (items[0].get("statistics") if items else {}) or {}
         metric = UnifiedVideoMetric(
@@ -270,7 +463,8 @@ class YouTubeConnector:
             "ids": f"channel=={self._channel_id(account)}",
             "startDate": start_date, "endDate": end_date,
             "metrics": "estimatedMinutesWatched,impressions,impressionClickThroughRate,subscribersGained,subscribersLost,views",
-            "filters": f"video=={video.platform_video_id}"}, cache=False)
+            "filters": f"video=={video.platform_video_id}"}, cache=False,
+            account_id=account.id)
         rows = resp.get("rows") or []
         if not rows:
             return {"watch_time_seconds": 0, "impressions": None, "ctr": None,
