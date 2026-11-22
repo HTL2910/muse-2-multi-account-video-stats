@@ -1,0 +1,27 @@
+{
+  "name": "multi-account-video-stats-web",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Frontend dashboard (approach_12) for multi-account-video-stats: Next.js + TypeScript + TanStack Query. This directory (src/web) is the Next.js project root — pages/ is the Pages Router directory. No next.config file is required: Next runs on defaults, and it generates tsconfig.json on first dev/build if absent. The typecheck script below is intentionally tsconfig-independent (all compiler options are passed as CLI flags) so CI can typecheck from a bare checkout.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit --strict --skipLibCheck --esModuleInterop --forceConsistentCasingInFileNames --jsx preserve --module esnext --moduleResolution bundler --target es2022 --lib dom,dom.iterable,es2022 pages/DashboardAccounts.tsx"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.62.0",
+    "next": "^15.3.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.8.0"
+  }
+}
